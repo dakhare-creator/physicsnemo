@@ -27,6 +27,7 @@ max_workers_preprocessing: 64  # Maximum parallel workers
 
 num_time_steps: 14
 num_training_samples: 8
+num_validation_samples: 8
 start_lr: 0.0001
 end_lr: 0.0000003
 epochs: 10000
