@@ -239,8 +239,8 @@ class Trainer:
             self.optimizer.step()
 
     @torch.no_grad()
-    def validate_with_rollout(self, epoch):
-        """Run validation using the rollout approach with relative error computation"""
+    def validate(self, epoch):
+        """Run validation error computation"""
         self.model.eval()
         
         MSE = torch.zeros(1, device=self.dist.device)
@@ -248,31 +248,30 @@ class Trainer:
         for idx, sample in enumerate(self.val_dataloader):
             sample = sample[0].to(self.dist.device)   # SimSample .to()
             T = self.rollout_steps
-            Fo = 3
-            # Forward rollout: expected to return [T,N,3]
+            
+            # Model forward
             pred_seq = self.model(sample=sample, data_stats=self.data_stats)
 
             # Exact sequence (if provided)
             exact_seq = None
             if sample.node_target is not None:
                 N = sample.node_target.size(0)
-                assert sample.node_target.size(1) == T * Fo
-                exact_seq = (
-                    sample.node_target.view(N, T, Fo)
-                    .transpose(0, 1)
-                    .contiguous()
+                Fo = 3  # output features per node
+                assert sample.node_target.size(1) == T * Fo, (
+                    f"target dim {sample.node_target.size(1)} != {T * Fo}"
                 )
+                exact_seq = sample.node_target.view(N, T, Fo).transpose(0, 1).contiguous()  # [T,N,Fo]
 
-            # Compute detailed relative error losses
+            # Compute and add error
             SqError = torch.square(pred_seq - exact_seq)
             MSE_w_time += torch.mean(SqError, dim=(1,2))
             MSE += torch.mean(SqError)
 
+        # Sum errors across all ranks
         if self.dist.world_size > 1:
             torch.distributed.all_reduce(MSE, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(MSE_w_time, op=torch.distributed.ReduceOp.SUM)
         
-        # Combine all statistics
         val_stats = {
             'MSE_w_time': MSE_w_time / self.num_validation_samples,
             'MSE': MSE / self.num_validation_samples,
@@ -341,7 +340,7 @@ def main(cfg: DictConfig) -> None:
         val_freq = 10
         if (epoch + 1) % val_freq == 0:
             # logger0.info(f"Validation started...")
-            val_stats = trainer.validate_with_rollout(epoch)
+            val_stats = trainer.validate(epoch)
             
             # Log detailed validation statistics
             logger0.info(
