@@ -44,7 +44,7 @@ from omegaconf import open_dict
 class Trainer:
     """Trainer for crash simulation models with unified SimSample input."""
 
-    def __init__(self, cfg: DictConfig, logger0: RankZeroLoggingWrapper, validation: bool = True):
+    def __init__(self, cfg: DictConfig, logger0: RankZeroLoggingWrapper):
         assert DistributedManager.is_initialized()
         self.dist = DistributedManager()
         self.cfg = cfg
@@ -105,7 +105,7 @@ class Trainer:
         )
         self.sampler = sampler
 
-        if validation:
+        if cfg.training.num_validation_samples > 0:
             self.num_validation_replicas = min(self.dist.world_size, cfg.training.num_validation_samples)
             self.num_validation_samples  = cfg.training.num_validation_samples // self.num_validation_replicas * self.num_validation_replicas
             logger0.info(f'Number of validation samples: {self.num_validation_samples}')
@@ -324,7 +324,8 @@ def main(cfg: DictConfig) -> None:
 
         if dist.world_size > 1:
             torch.distributed.barrier()
-        if dist.rank == 0:
+
+        if dist.rank == 0 and (epoch + 1) % cfg.training.save_ckpt_every_n_epochs == 0:
             save_checkpoint(
                 cfg.training.ckpt_path,
                 models=trainer.model,
@@ -336,9 +337,7 @@ def main(cfg: DictConfig) -> None:
             logger.info(f"Saved model on rank {dist.rank}")
 
         # Validation
-        #TODO: Add validation frequency to config
-        val_freq = 10
-        if (epoch + 1) % val_freq == 0:
+        if cfg.training.num_validation_samples > 0 and (epoch + 1) % cfg.training.validate_every_n_epochs == 0:
             # logger0.info(f"Validation started...")
             val_stats = trainer.validate(epoch)
             
