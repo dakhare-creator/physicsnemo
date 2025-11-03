@@ -168,8 +168,9 @@ class InferenceWorker:
                     k: v.to(self.device)
                     for k, v in getattr(dataset, "edge_stats", {}).items()
                 },
-                thickness={
-                    k: v.to(self.device) for k, v in dataset.thickness_stats.items()
+                feature={
+                    k: v.to(self.device)
+                    for k, v in getattr(dataset, "feature_stats", {}).items()
                 },
             )
 
@@ -196,12 +197,7 @@ class InferenceWorker:
                 sample = sample.to(self.device)
 
                 # Forward rollout: expected to return [T,N,3]
-                pred_seq = self.model(
-                    node_features=sample.node_features,
-                    edge_index=sample.edge_index,
-                    edge_features=sample.edge_features,
-                    data_stats=data_stats,
-                )
+                pred_seq = self.model(sample=sample, data_stats=data_stats)
 
                 # Exact sequence (if provided)
                 exact_seq = None
