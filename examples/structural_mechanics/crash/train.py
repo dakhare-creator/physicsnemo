@@ -124,11 +124,11 @@ class Trainer:
             # Create a validation dataset
             val_cfg = self.cfg.datapipe
             with open_dict(val_cfg):  # or open_dict(cfg) to open the whole tree
-                val_cfg.data_dir = self.cfg.inference.raw_data_dir_test
+                val_cfg.data_dir = self.cfg.training.raw_data_dir_validation
                 val_cfg.num_samples = self.num_validation_samples
             val_dataset = instantiate(
                 val_cfg,
-                name="crash_test",
+                name="crash_validation",
                 reader=reader,
                 split="test",
                 logger=logger0,
@@ -266,17 +266,15 @@ class Trainer:
             # Model forward
             pred_seq = self.model(sample=sample, data_stats=self.data_stats)
 
-            # Exact sequence (if provided)
-            exact_seq = None
-            if sample.node_target is not None:
-                N = sample.node_target.size(0)
-                Fo = 3  # output features per node
-                assert sample.node_target.size(1) == T * Fo, (
-                    f"target dim {sample.node_target.size(1)} != {T * Fo}"
-                )
-                exact_seq = (
-                    sample.node_target.view(N, T, Fo).transpose(0, 1).contiguous()
-                )  # [T,N,Fo]
+            # Exact sequence
+            N = sample.node_target.size(0)
+            Fo = 3  # output features per node
+            assert sample.node_target.size(1) == T * Fo, (
+                f"target dim {sample.node_target.size(1)} != {T * Fo}"
+            )
+            exact_seq = (
+                sample.node_target.view(N, T, Fo).transpose(0, 1).contiguous()
+            )  # [T,N,Fo]
 
             # Compute and add error
             SqError = torch.square(pred_seq - exact_seq)
@@ -341,7 +339,7 @@ def main(cfg: DictConfig) -> None:
         if dist.world_size > 1:
             torch.distributed.barrier()
 
-        if dist.rank == 0 and (epoch + 1) % cfg.training.save_ckpt_every_n_epochs == 0:
+        if dist.rank == 0 and (epoch + 1) % cfg.training.save_chckpoint_freq == 0:
             save_checkpoint(
                 cfg.training.ckpt_path,
                 models=trainer.model,
@@ -355,7 +353,7 @@ def main(cfg: DictConfig) -> None:
         # Validation
         if (
             cfg.training.num_validation_samples > 0
-            and (epoch + 1) % cfg.training.validate_every_n_epochs == 0
+            and (epoch + 1) % cfg.training.validation_freq == 0
         ):
             # logger0.info(f"Validation started...")
             val_stats = trainer.validate(epoch)
