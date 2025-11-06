@@ -18,6 +18,7 @@ import torch
 from torch.utils.checkpoint import checkpoint as ckpt
 
 from physicsnemo.models.transolver import Transolver
+from physicsnemo.models.transolver.transolver_crash import Transolver_crash
 from physicsnemo.models.meshgraphnet import MeshGraphNet
 from physicsnemo.models.figconvnet.figconvunet import FIGConvUNet
 
@@ -136,9 +137,6 @@ class TransolverAutoregressiveRolloutTraining_features(Transolver):
         ].item()  # ref idx for min x point on car geometry
         y_t1_diff_0 = y_t1 - y_t1[ref_idx]
         for t in range(self.rollout_steps):
-            # time_t = 0.0 if self.rollout_steps <= 1 else t / (self.rollout_steps - 1)
-            # time_t = torch.tensor([time_t], device=device, dtype=torch.float32)
-
             # Velocity normalization
             vel = (y_t1 - y_t0) / self.dt
             vel_norm = (vel - data_stats["node"]["norm_vel_mean"]) / (
@@ -148,7 +146,6 @@ class TransolverAutoregressiveRolloutTraining_features(Transolver):
             nowall_y_t2 = self.dt * vel + y_t1
             collision_emb = torch.nn.functional.elu(10 * (nowall_y_t2[:, 0:1] - wall_x))
             damage_emb += torch.nn.functional.softmax(collision_emb**3, dim=0)
-            # damage_emb += torch.nn.functional.relu(collision_emb)
             y_t1_diff = y_t1 - y_t1[ref_idx]
             diff = y_t1_diff - y_t1_diff_0
 
@@ -160,6 +157,95 @@ class TransolverAutoregressiveRolloutTraining_features(Transolver):
             def step_fn(fx, embedding):
                 return super(
                     TransolverAutoregressiveRolloutTraining_features, self
+                ).forward(fx=fx, embedding=embedding)
+
+            if self.training:
+                outf = ckpt(
+                    step_fn,
+                    fx_t.unsqueeze(0),
+                    embedding.unsqueeze(0),
+                    use_reentrant=False,
+                ).squeeze(0)
+            else:
+                outf = step_fn(fx_t.unsqueeze(0), embedding.unsqueeze(0)).squeeze(0)
+
+            # De-normalize acceleration
+            acc = (
+                outf * data_stats["node"]["norm_acc_std"]
+                + data_stats["node"]["norm_acc_mean"]
+            )
+            vel = self.dt * acc + vel
+            y_t2 = self.dt * vel + y_t1
+
+            outputs.append(y_t2)
+            y_t1, y_t0 = y_t2, y_t1
+
+        return torch.stack(outputs, dim=0)  # [T,N,3]
+
+
+class TransolverAutoregressiveRolloutTraining_crash(Transolver_crash):
+    """
+    Transolver model with autoregressive rollout training.
+
+    Predicts sequence by autoregressively updating velocity and position
+    using predicted accelerations. Supports gradient checkpointing during training.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.dt: float = kwargs.pop("dt")
+        self.initial_vel: torch.Tensor = kwargs.pop("initial_vel")
+        self.rollout_steps: int = kwargs.pop("num_time_steps") - 1
+        super().__init__(*args, **kwargs)
+
+    def forward(self, sample: SimSample, data_stats: dict) -> torch.Tensor:
+        """
+        Args:
+            sample: SimSample containing node_features and node_target
+            data_stats: dict containing normalization stats
+        Returns:
+            [T, N, 3] rollout of predicted positions
+        """
+        inputs = sample.node_features
+        coords = inputs["coords"]  # [N,3]
+        features = inputs.get("features", coords.new_zeros((coords.size(0), 0)))
+        N = coords.size(0)
+        # device = coords.device
+
+        # Initial states
+        y_t1 = coords  # [N,3]
+        y_t0 = y_t1 - self.initial_vel * self.dt  # backstep using initial velocity
+
+        outputs: list[torch.Tensor] = []
+        wall_x = (-30 - data_stats["node"]["pos_mean"][0]) / data_stats["node"][
+            "pos_std"
+        ][0]
+        damage_emb = torch.zeros(N, 1, device=coords.device)
+        ref_idx = coords.argmin(dim=0)[
+            0
+        ].item()  # ref idx for min x point on car geometry
+        y_t1_diff_0 = y_t1 - y_t1[ref_idx]
+        for t in range(self.rollout_steps):
+            # Velocity normalization
+            vel = (y_t1 - y_t0) / self.dt
+            vel_norm = (vel - data_stats["node"]["norm_vel_mean"]) / (
+                data_stats["node"]["norm_vel_std"] + EPS
+            )
+
+            nowall_y_t2 = self.dt * vel + y_t1
+            collision_emb = torch.nn.functional.elu(10 * (nowall_y_t2[:, 0:1] - wall_x))
+            damage_emb += torch.nn.functional.softmax(collision_emb**3, dim=0)
+            y_t1_diff = y_t1 - y_t1[ref_idx]
+            diff = y_t1_diff_0 - y_t1_diff
+
+            # Model input
+            fx_t = torch.cat(
+                [y_t1_diff, vel_norm, collision_emb, damage_emb], dim=-1
+            )  # [N, 3+F+1]
+            embedding = torch.cat([features, diff], dim=-1)
+
+            def step_fn(fx, embedding):
+                return super(
+                    TransolverAutoregressiveRolloutTraining_crash, self
                 ).forward(fx=fx, embedding=embedding)
 
             if self.training:

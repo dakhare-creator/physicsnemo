@@ -31,3 +31,4 @@ SOFTWARE.
 """
 
 from .transolver import Transolver
+from .transolver_crash import Transolver_crash
