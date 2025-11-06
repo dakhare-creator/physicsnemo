@@ -52,7 +52,6 @@ class TransolverAutoregressiveRolloutTraining(Transolver):
         coords = inputs["coords"]  # [N,3]
         features = inputs.get("features", coords.new_zeros((coords.size(0), 0)))
         N = coords.size(0)
-        device = coords.device
 
         # Initial states
         y_t1 = coords  # [N,3]
@@ -60,9 +59,6 @@ class TransolverAutoregressiveRolloutTraining(Transolver):
 
         outputs: list[torch.Tensor] = []
         for t in range(self.rollout_steps):
-            time_t = 0.0 if self.rollout_steps <= 1 else t / (self.rollout_steps - 1)
-            time_t = torch.tensor([time_t], device=device, dtype=torch.float32)
-
             # Velocity normalization
             vel = (y_t1 - y_t0) / self.dt
             vel_norm = (vel - data_stats["node"]["norm_vel_mean"]) / (
@@ -70,9 +66,7 @@ class TransolverAutoregressiveRolloutTraining(Transolver):
             )
 
             # Model input
-            fx_t = torch.cat(
-                [vel_norm, features, time_t.expand(N, 1)], dim=-1
-            )  # [N, 3+F+1]
+            fx_t = torch.cat([vel_norm, features], dim=-1)  # [N, 3+F+1]
 
             def step_fn(fx, embedding):
                 return super(TransolverAutoregressiveRolloutTraining, self).forward(
