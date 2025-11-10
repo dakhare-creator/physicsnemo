@@ -134,7 +134,7 @@ class Trainer:
                 val_cfg,
                 name="crash_validation",
                 reader=reader,
-                split="test",
+                split="validation",
                 logger=logger0,
             )
 
