@@ -150,13 +150,14 @@ class InferenceWorker:
             os.symlink(run_path, os.path.join(tmpdir, run_name))
 
             # Instantiate a dataset that sees exactly one run
+            reader = instantiate(self.cfg.reader)
             dataset = instantiate(
                 self.cfg.datapipe,
                 name="crash_test",
+                reader=reader,
                 split="test",
                 num_steps=self.cfg.training.num_time_steps,
                 num_samples=1,
-                write_vtp=True,  # ensures it writes ./output_<run_name>/frame_*.vtp
                 logger=self.logger,
                 data_dir=tmpdir,  # IMPORTANT: dataset reads from the tmpdir with single run
             )
