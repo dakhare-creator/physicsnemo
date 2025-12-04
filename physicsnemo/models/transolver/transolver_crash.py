@@ -30,6 +30,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -60,6 +61,8 @@ from physicsnemo.models.transolver.Physics_Attention import (
     PhysicsAttentionStructuredMesh2D,
     PhysicsAttentionStructuredMesh3D,
 )
+
+# from torch_geometric.nn import fps
 
 ACTIVATION = {
     "gelu": nn.GELU,
@@ -431,6 +434,230 @@ class PhysicsAttentionIrregularMesh(PhysicsAttentionBase):
         return embedding_mid, fx_mid
 
 
+class NewAttention_global_buffer(nn.Module):
+    """
+    Specialization of PhysicsAttention to Irregular Meshes
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dim_head=64,
+        dropout=0.0,
+        slice_num=64,
+        n_global_feat=128,
+        use_te=True,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = dim_head * heads
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.qkv_project1 = nn.Linear(dim_head, 3 * dim_head)
+        self.qkv_project2 = nn.Linear(dim_head, 3 * dim_head)
+        self.qkv_project_global = nn.Linear(dim_head, 3 * dim_head)
+        # self.qkv_project_global1 = nn.Linear(dim_head, 3 * dim_head)
+        self.q_global = nn.Parameter(torch.randn(heads, n_global_feat, dim_head))
+        self.out_linear = nn.Linear(inner_dim, dim)
+        self.out_dropout = nn.Dropout(dropout)
+        self.ln_1 = nn.LayerNorm(dim_head)
+        self.ln_2 = nn.LayerNorm(dim_head)
+
+    def forward(self, x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+
+        Input x should have shape of [Batch, N_tokens, N_Channels] ([B, N, C])
+        """
+
+        with record_function("forward"):
+            # Gather global features from point cloud
+            scaling_factor = math.sqrt(self.dim_head)
+            x_mid = self.in_project_x(x)
+            x_mid = rearrange(
+                x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
+            )
+            x_mid = x_mid.permute(0, 2, 1, 3)  # [B, H, N, D]
+            x_mid = self.ln_1(x_mid)
+            qkv = self.qkv_project1(x_mid)
+            qkv = rearrange(qkv, " B h N (t d) -> B h N t d", t=3, d=self.dim_head)
+            q, k, v = qkv.unbind(-2)
+            scores = torch.einsum("hqd,bhkd->bhqk", self.q_global, k) / scaling_factor
+            scores = scores.softmax(
+                dim=-2
+            )  # sparse score such that each node contribute to one global feature
+            attn = scores.softmax(dim=-1)
+            global_features = torch.einsum("bhqk,bhkd->bhqd", attn, v)
+            global_features = self.ln_2(global_features)
+
+            # # global feature attention
+            # qkv_global = self.qkv_project_global1(global_features)
+            # qkv_global = rearrange(qkv_global, " B h n (t d) -> B h n t d", t=3, d=self.dim_head)
+            # q_global, k_global, v_global = qkv_global.unbind(-2)
+            # global_features = torch.nn.functional.scaled_dot_product_attention(
+            #     q_global, k_global, v_global, is_causal=False
+            # )
+
+            # Project global features onto the point cloud
+            qkv_global = self.qkv_project_global(global_features)
+            qkv_global = rearrange(
+                qkv_global, " B h n (t d) -> B h n t d", t=3, d=self.dim_head
+            )
+            q_global, k_global, v_global = qkv_global.unbind(-2)
+            qkv = self.qkv_project2(x_mid)
+            qkv = rearrange(qkv, " B h N (t d) -> B h N t d", t=3, d=self.dim_head)
+            q, k, v = qkv.unbind(-2)
+            # score of each node with the global features
+            global_scores = (
+                torch.einsum("bhqd,bhkd->bhqk", q, k_global) / scaling_factor
+            )
+            # score of each node with itself
+            local_scores = (
+                torch.linalg.vecdot(q, k, dim=-1).unsqueeze(-1) / scaling_factor
+            )
+            scores = torch.cat([global_scores, local_scores], dim=-1)
+            attn = scores.softmax(dim=-1)
+            global_attn = attn[..., :-1]
+            local_attn = attn[..., -1:]
+            # combine global and local features
+            local_features = (
+                torch.einsum("bhak,bhkd->bhad", global_attn, v_global) + local_attn * v
+            )
+            out_x = local_features.permute(0, 2, 1, 3)  # [B, N, H, D]
+            out_x = rearrange(out_x, "b n h d -> b n (h d)")
+            out_x = self.out_linear(out_x)
+            return self.out_dropout(out_x)
+
+
+class NewAttention_qpoints(nn.Module):
+    """
+    Specialization of PhysicsAttention to Irregular Meshes
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dim_head=64,
+        dropout=0.0,
+        slice_num=64,
+        n_global_feat=128,
+        use_te=True,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = dim_head * heads
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.kv_project1 = nn.Linear(dim_head, 2 * dim_head)
+        self.qkv_project2 = nn.Linear(dim_head, 3 * dim_head)
+        self.kv_project_global = nn.Linear(dim_head, 2 * dim_head)
+        # self.qkv_project_global1 = nn.Linear(dim_head, 3 * dim_head)
+        self.gatherer_project = nn.Linear(dim_head, n_global_feat)
+        self.qkv_project_global_fps = nn.Linear(dim_head, 1 * dim_head)
+        self.out_linear = nn.Linear(inner_dim, dim)
+        self.out_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+
+        Input x should have shape of [Batch, N_tokens, N_Channels] ([B, N, C])
+        """
+
+        with record_function("forward"):
+            # Gather global features from point cloud
+            scaling_factor = math.sqrt(self.dim_head)
+            x_mid = self.in_project_x(x)
+            x_mid = rearrange(
+                x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
+            )
+            x_mid = x_mid.permute(0, 2, 1, 3)  # [B, H, N, D]
+            kv = self.kv_project1(x_mid)
+            kv = rearrange(kv, " B h N (t d) -> B h N t d", t=2, d=self.dim_head)
+            k, v = kv.unbind(-2)
+
+            # x_global_fps = x_mid[:, :, parts]
+            # x_global_fps = torch.einsum("bhnf,bhnd->bhfd", torch.softmax(self.gatherer_project(x_mid) / 0.1, dim=-2), x_mid)
+
+            # # TODO(Deepak): Need to crosscheck again
+            # x_mid:   [B, H, N, D]
+            scores = self.gatherer_project(x_mid)  # [B, H, N, F]
+            B, H, N, D = x_mid.shape
+            Fdim = scores.shape[-1]
+            # 1) Get a scalar score per (B,H,N) to choose which positions to keep.
+            #    You can use max, mean, norm, whatever makes sense.
+            #    Example: L2 norm across F
+            scores_scalar = scores.norm(dim=-1)  # [B, H, N]
+            # 2) Top-k over N using this scalar score
+            topk_vals, topk_idx = torch.topk(
+                scores_scalar, k=16, dim=-1
+            )  # both [B,H,K]
+            # 3) Gather scores at those N positions → [B, H, K, F]
+            scores_topk = torch.gather(
+                scores,  # [B,H,N,F]
+                dim=2,
+                index=topk_idx.unsqueeze(-1).expand(-1, -1, -1, Fdim),
+            )  # [B,H,K,F]
+            # 4) Compute attention over K (N is now restricted to K)
+            attn = torch.softmax(scores_topk / 0.1, dim=2)  # [B, H, K, F]
+            # 5) Gather x_mid at those K positions → [B, H, K, D]
+            x_mid_topk = torch.gather(
+                x_mid,  # [B,H,N,D]
+                dim=2,
+                index=topk_idx.unsqueeze(-1).expand(-1, -1, -1, D),
+            )  # [B,H,K,D]
+            # 6) Einsum exactly like before, treating K as the "n" dimension
+            x_global_fps = torch.einsum("bhnf,bhnd->bhfd", attn, x_mid_topk)
+
+            q_global_fps = self.qkv_project_global_fps(x_global_fps)
+            scores = torch.einsum("bhqd,bhkd->bhqk", q_global_fps, k) / scaling_factor
+            scores = scores.softmax(
+                dim=-2
+            )  # sparse score such that each node contribute to one global feature
+            attn = scores.softmax(dim=-1)
+            global_features = torch.einsum("bhqk,bhkd->bhqd", attn, v)
+
+            # # global feature attention
+            # qkv_global = self.qkv_project_global1(global_features)
+            # qkv_global = rearrange(qkv_global, " B h n (t d) -> B h n t d", t=3, d=self.dim_head)
+            # q_global, k_global, v_global = qkv_global.unbind(-2)
+            # global_features = torch.nn.functional.scaled_dot_product_attention(
+            #     q_global, k_global, v_global, is_causal=False
+            # )
+
+            # Project global features onto the point cloud
+            kv_global = self.kv_project_global(global_features)
+            kv_global = rearrange(
+                kv_global, " B h n (t d) -> B h n t d", t=2, d=self.dim_head
+            )
+            k_global, v_global = kv_global.unbind(-2)
+            qkv = self.qkv_project2(x_mid)
+            qkv = rearrange(qkv, " B h N (t d) -> B h N t d", t=3, d=self.dim_head)
+            q, k, v = qkv.unbind(-2)
+            # score of each node with the global features
+            global_scores = (
+                torch.einsum("bhqd,bhkd->bhqk", q, k_global) / scaling_factor
+            )
+            # score of each node with itself
+            local_scores = (
+                torch.linalg.vecdot(q, k, dim=-1).unsqueeze(-1) / scaling_factor
+            )
+            scores = torch.cat([global_scores, local_scores], dim=-1)
+            attn = scores.softmax(dim=-1)
+            global_attn = attn[..., :-1]
+            local_attn = attn[..., -1:]
+            # combine global and local features
+            local_features = (
+                torch.einsum("bhak,bhkd->bhad", global_attn, v_global) + local_attn * v
+            )
+            out_x = local_features.permute(0, 2, 1, 3)  # [B, N, H, D]
+            out_x = rearrange(out_x, "b n h d -> b n (h d)")
+            out_x = self.out_linear(out_x)
+            return self.out_dropout(out_x)
+
+
 class Transolver_block(nn.Module):
     """Transformer encoder block, replacing standard attention with physics attention."""
 
@@ -457,13 +684,14 @@ class Transolver_block(nn.Module):
         self.last_layer = last_layer
         if use_te:
             self.ln_1 = te.LayerNorm(hidden_dim)
-            self.ln_2 = te.LayerNorm(hidden_dim)
+            self.ln_2 = lambda x: x  # te.LayerNorm(hidden_dim)
         else:
             self.ln_1 = nn.LayerNorm(hidden_dim)
-            self.ln_2 = nn.LayerNorm(hidden_dim)
+            self.ln_2 = lambda x: x  # nn.LayerNorm(hidden_dim)
 
         if spatial_shape is None:
-            self.Attn = PhysicsAttentionIrregularMesh(
+            # self.Attn = PhysicsAttentionIrregularMesh(
+            self.Attn = NewAttention_qpoints(
                 hidden_dim,
                 heads=num_heads,
                 dim_head=hidden_dim // num_heads,
@@ -701,7 +929,7 @@ class Transolver_crash(Module):
 
         # This MLP is the initial projection onto the hidden space
         self.preprocess_fx = MLP(
-            functional_dim,
+            functional_dim + embedding_dim,
             n_hidden * 2,
             n_hidden,
             n_layers=0,
@@ -710,15 +938,15 @@ class Transolver_crash(Module):
             use_te=use_te,
         )
 
-        self.preprocess_embedding = MLP(
-            embedding_dim,
-            n_hidden * 2,
-            n_hidden,
-            n_layers=0,
-            res=False,
-            act=act,
-            use_te=use_te,
-        )
+        # self.preprocess_embedding = MLP(
+        #     embedding_dim,
+        #     n_hidden * 2,
+        #     n_hidden,
+        #     n_layers=0,
+        #     res=False,
+        #     act=act,
+        #     use_te=use_te,
+        # )
         self.time_input = time_input
         self.n_hidden = n_hidden
         if time_input:
@@ -743,6 +971,9 @@ class Transolver_crash(Module):
                 for _ in range(n_layers)
             ]
         )
+        # n_nodes = 384862
+        # self.embedding_vec = nn.Parameter(torch.randn(len(self.blocks), 1, n_nodes, n_hidden))
+        # self.embedding = nn.Parameter(torch.zeros([1, n_nodes, self.n_head, self.slice_num,]), requires_grad=False)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -812,6 +1043,7 @@ class Transolver_crash(Module):
         fx: torch.Tensor | None,
         embedding: torch.Tensor | None = None,
         time: torch.Tensor | None = None,
+        parts: list[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass of the transolver model.
@@ -848,13 +1080,12 @@ class Transolver_crash(Module):
         #     if embedding is None:
         #         raise ValueError("Embedding is required for unstructured data")
 
-        # # Combine the embedding and functional input:
-        # if embedding is not None:
-        #     fx = torch.cat((embedding, fx), -1)
+        # Combine the embedding and functional input:
+        if embedding is not None:
+            fx = torch.cat((embedding, fx), -1)
 
         # Apply preprocessing
         fx = self.preprocess_fx(fx)
-        embedding = self.preprocess_embedding(embedding)
 
         # if time is not None:
         #     time_emb = timestep_embedding(time, self.n_hidden).repeat(
@@ -864,7 +1095,7 @@ class Transolver_crash(Module):
         #     fx = fx + time_emb
 
         for i, block in enumerate(self.blocks):
-            fx = block(fx, embedding)
+            fx = block(fx, parts)
 
         # if self.structured_shape is not None:
         #     if unflatten_output:
