@@ -174,9 +174,7 @@ class PhysicsAttentionBase(nn.Module, ABC):
         self.out_dropout = nn.Dropout(dropout)
 
     @abstractmethod
-    def project_input_onto_slices(
-        self, x, embedding
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def project_input_onto_slices(self, x) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Project the input onto the slice space.
         """
@@ -346,7 +344,7 @@ class PhysicsAttentionBase(nn.Module, ABC):
             out_x = self.out_linear(out_x)
             return self.out_dropout(out_x)
 
-    def forward(self, x: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, parts: list[torch.Tensor]) -> torch.Tensor:
         """
         Forward pass of the Physics Attention module.
 
@@ -355,11 +353,11 @@ class PhysicsAttentionBase(nn.Module, ABC):
 
         with record_function("forward"):
             # Project the inputs onto learned spaces:
-            embedding_mid, fx_mid = self.project_input_onto_slices(x, embedding)
+            x_mid, fx_mid = self.project_input_onto_slices(x)
 
             # Perform the linear projection of learned latent space onto slices:
 
-            slice_projections = self.in_project_slice(embedding_mid)
+            slice_projections = self.in_project_slice(x_mid)
 
             # Slice projections has shape [B, N_tokens, N_head, Head_dim], but head_dim may have changed!
 
@@ -397,17 +395,13 @@ class PhysicsAttentionIrregularMesh(PhysicsAttentionBase):
         super().__init__(dim, heads, dim_head, dropout, slice_num, use_te)
         inner_dim = dim_head * heads
         if use_te:
-            # self.in_project_x = nn.Linear(dim, inner_dim)
-            self.in_project_embd = te.Linear(dim, inner_dim)
+            self.in_project_x = te.Linear(dim, inner_dim)
             self.in_project_fx = te.Linear(dim, inner_dim)
         else:
-            # self.in_project_x = nn.Linear(dim, inner_dim)
-            self.in_project_embd = nn.Linear(dim, inner_dim)
+            self.in_project_x = nn.Linear(dim, inner_dim)
             self.in_project_fx = nn.Linear(dim, inner_dim)
 
-    def project_input_onto_slices(
-        self, x, embedding
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def project_input_onto_slices(self, x) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Project the input onto the slice space.
 
@@ -421,17 +415,11 @@ class PhysicsAttentionIrregularMesh(PhysicsAttentionBase):
         fx = self.in_project_fx(x)
         fx_mid = rearrange(fx, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head)
 
-        # x_mid = rearrange(
-        #     self.in_project_x(x), "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
-        # )
-        embedding_mid = rearrange(
-            self.in_project_embd(embedding),
-            "B N (h d) -> B N h d",
-            h=self.heads,
-            d=self.dim_head,
+        x_mid = rearrange(
+            self.in_project_x(x), "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
         )
 
-        return embedding_mid, fx_mid
+        return x_mid, fx_mid
 
 
 class FlareAttention(nn.Module):
@@ -531,9 +519,7 @@ class LatentAttention_topk(nn.Module):
             q, k, v = qkv.unbind(-2)
 
             # option 5:
-            topk = torch.topk(
-                torch.linalg.norm(q, dim=-1), k=128, dim=-1, largest=False
-            )
+            topk = torch.topk(torch.linalg.norm(q, dim=-1), k=128, dim=-1)
             qg = torch.gather(
                 q, -2, topk[1].unsqueeze(-1).expand(-1, -1, -1, q.shape[-1])
             )  # [B, H, K, D]
