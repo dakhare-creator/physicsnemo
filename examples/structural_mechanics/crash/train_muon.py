@@ -19,6 +19,9 @@ import sys
 import time
 import logging
 
+from contextlib import nullcontext
+from typing import Any, Callable, Sequence
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 import hydra
@@ -28,6 +31,7 @@ from omegaconf import DictConfig
 import torch
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
+from torch.optim import Optimizer
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
@@ -38,6 +42,78 @@ from physicsnemo.launch.utils import load_checkpoint, save_checkpoint
 # Import unified datapipe
 from datapipe import SimSample, simsample_collate
 from omegaconf import open_dict
+
+
+class CombinedOptimizer(Optimizer):
+    """Combine multiple PyTorch optimizers into a single Optimizer-like interface.
+
+    The wrapper concatenates the *param_groups* from all contained optimizers so
+    that learning-rate schedulers (e.g., ReduceLROnPlateau, CosineAnnealingLR)
+    operate transparently across every parameter. Only a minimal subset of the
+    *torch.optim.Optimizer* API is implemented—extend as needed.
+    """
+
+    def __init__(
+        self,
+        optimizers: Sequence[Optimizer],
+        torch_compile_kwargs: dict[str, Any] | None = None,
+    ):
+        if not optimizers:
+            raise ValueError("`optimizers` must contain at least one optimizer.")
+
+        self.optimizers = optimizers
+
+        # Collect parameter groups from all optimizers. We pass an empty
+        # *defaults* dict because hyper-parameters are managed by the inner
+        # optimizers, not this wrapper.
+        param_groups = [g for opt in optimizers for g in opt.param_groups]
+        super().__init__(param_groups, defaults={})
+
+        if torch_compile_kwargs is None:
+            self.step_fns: list[Callable] = [opt.step for opt in optimizers]
+        else:
+            self.step_fns: list[Callable] = [
+                torch.compile(opt.step, **torch_compile_kwargs) for opt in optimizers
+            ]
+
+    def zero_grad(self, *args, **kwargs) -> None:
+        """Nullify gradients"""
+        for opt in self.optimizers:
+            opt.zero_grad(*args, **kwargs)
+
+    def step(self, closure=None) -> None:
+        for step_fn in self.step_fns:
+            if closure is None:
+                step_fn()
+            else:
+                step_fn(closure)
+
+    def state_dict(self):
+        return {"optimizers": [opt.state_dict() for opt in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        for opt, sd in zip(self.optimizers, state_dict["optimizers"]):
+            opt.load_state_dict(sd)
+
+        self.param_groups = [g for opt in self.optimizers for g in opt.param_groups]
+
+
+def get_autocast_context(precision: str) -> nullcontext:
+    """
+    Returns the appropriate autocast context for mixed precision training.
+
+    Args:
+        precision (str): The desired precision. Supported values are "float16", "bfloat16", or any other string for no autocast.
+
+    Returns:
+        Context manager: An autocast context for the specified precision, or a nullcontext if precision is not recognized.
+    """
+    if precision == "float16":
+        return autocast("cuda", dtype=torch.float16)
+    elif precision == "bfloat16":
+        return autocast("cuda", dtype=torch.bfloat16)
+    else:
+        return nullcontext()
 
 
 class Trainer:
@@ -182,31 +258,63 @@ class Trainer:
                 find_unused_parameters=self.dist.find_unused_parameters,
             )
 
+        # param_iter = self.model.module.parameters() if isinstance(self.model, DistributedDataParallel) else self.model.parameters()
+        muon_params = [p for p in self.model.parameters() if p.ndim == 2]
+        other_params = [p for p in self.model.parameters() if p.ndim != 2]
+        print(f"muon_params: {len(muon_params)}")
+        print(f"other_params: {len(other_params)}")
+
         # Loss
         self.criterion = torch.nn.MSELoss()
 
-        # Optimizer
-        self.optimizer = None
-        try:
-            if cfg.training.use_apex:
-                from apex.optimizers import FusedAdam
+        # # Optimizer
+        # self.optimizer = None
+        # try:
+        #     if cfg.training.use_apex:
+        #         from apex.optimizers import FusedAdam
 
-                self.optimizer = FusedAdam(
-                    self.model.parameters(), lr=cfg.training.start_lr
-                )
-        except ImportError:
-            logger0.warning("Apex not installed, falling back to Adam optimizer.")
-        if self.optimizer is None:
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(), lr=cfg.training.start_lr
-            )
-        logger0.info(f"Using {self.optimizer.__class__.__name__} optimizer")
+        #         self.optimizer = FusedAdam(
+        #             self.model.parameters(), lr=cfg.training.start_lr
+        #         )
+        # except ImportError:
+        #     logger0.warning("Apex not installed, falling back to Adam optimizer.")
+        # if self.optimizer is None:
+        #     self.optimizer = torch.optim.Adam(
+        #         self.model.parameters(), lr=cfg.training.start_lr
+        #     )
+        # logger0.info(f"Using {self.optimizer.__class__.__name__} optimizer")
+
+        base_lr = cfg.training.start_lr
+        weight_decay = getattr(cfg.training, "weight_decay", 1.0e-4)
+
+        base_opt = torch.optim.AdamW(
+            other_params,
+            lr=base_lr,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999),
+            eps=1.0e-8,
+        )
+
+        muon_opt = torch.optim.Muon(
+            muon_params,
+            lr=base_lr,
+            weight_decay=weight_decay,
+            adjust_lr_fn="match_rms_adamw",
+        )
+        self.optimizer = CombinedOptimizer(optimizers=[muon_opt, base_opt])
 
         # Scheduler
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=cfg.training.epochs, eta_min=cfg.training.end_lr
         )
         self.scaler = GradScaler("cuda", enabled=self.amp)
+
+        # # Scheduler
+        # self.scheduler = torch.optim.lr_scheduler.StepLR(
+        #     # self.optimizer, step_size=cfg.training.step_size, gamma=cfg.training.gamma
+        #     self.optimizer, step_size=250, gamma=0.834
+        # )
+        # self.scaler = GradScaler(enabled=self.amp)
 
         # Checkpoint
         if self.dist.world_size > 1:

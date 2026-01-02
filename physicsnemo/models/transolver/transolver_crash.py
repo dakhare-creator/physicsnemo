@@ -476,7 +476,7 @@ class FlareAttention(nn.Module):
             return self.out_dropout(out_x)
 
 
-class LatentAttention_topk(nn.Module):
+class LinearNO(nn.Module):
     """
     Specialization of PhysicsAttention to Irregular Meshes
     """
@@ -494,6 +494,59 @@ class LatentAttention_topk(nn.Module):
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
+        inner_dim = dim_head * heads
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.qkv_project = nn.Linear(dim_head, 3 * dim_head)
+        self.out_linear = nn.Linear(inner_dim, dim)
+        self.out_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+
+        Input x should have shape of [Batch, N_tokens, N_Channels] ([B, N, C])
+        """
+
+        with record_function("forward"):
+            x_mid = self.in_project_x(x)
+            x_mid = rearrange(
+                x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
+            )
+            x_mid = x_mid.permute(0, 2, 1, 3)  # [B, H, N, D]
+            qkv = self.qkv_project(x_mid)
+            qkv = rearrange(qkv, " B h N (t d) -> B h N t d", t=3, d=self.dim_head)
+            q, k, v = qkv.unbind(-2)
+
+            q = nn.functional.softmax(q, dim=-1)
+            k = nn.functional.softmax(k, dim=-1)
+            kv = k.transpose(-2, -1) @ v  # [B, H, N, D]
+            qkv = q @ kv  # [B, H, N, D]
+
+            out_x = qkv.permute(0, 2, 1, 3)  # [B, N, H, D]
+            out_x = rearrange(out_x, "b n h d -> b n (h d)")
+            out_x = self.out_linear(out_x)
+            return self.out_dropout(out_x)
+
+
+class LatentAttention_topk_QK(nn.Module):
+    """
+    Specialization of PhysicsAttention to Irregular Meshes
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dim_head=64,
+        dropout=0.0,
+        slice_num=64,
+        n_global_feat=64,
+        use_te=True,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.n_global_feat = n_global_feat
         inner_dim = dim_head * heads
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.qkv = nn.Linear(dim_head, 3 * dim_head)
@@ -519,17 +572,33 @@ class LatentAttention_topk(nn.Module):
             q, k, v = qkv.unbind(-2)
 
             # option 5:
-            topk = torch.topk(torch.linalg.norm(q, dim=-1), k=128, dim=-1)
-            qg = torch.gather(
+            topk = torch.topk(
+                torch.linalg.norm(q, dim=-1), k=self.n_global_feat, dim=-1
+            )
+            qg1 = torch.gather(
                 q, -2, topk[1].unsqueeze(-1).expand(-1, -1, -1, q.shape[-1])
             )  # [B, H, K, D]
-            kg = torch.gather(
+            kg1 = torch.gather(
+                k, -2, topk[1].unsqueeze(-1).expand(-1, -1, -1, q.shape[-1])
+            )  # [B, H, K, D]
+            topk = torch.topk(
+                torch.linalg.norm(k, dim=-1), k=self.n_global_feat, dim=-1
+            )
+            kg2 = torch.gather(
                 k, -2, topk[1].unsqueeze(-1).expand(-1, -1, -1, k.shape[-1])
+            )  # [B, H, K, D]
+            vg2 = torch.gather(
+                v, -2, topk[1].unsqueeze(-1).expand(-1, -1, -1, k.shape[-1])
             )  # [B, H, K, D]
 
             # FLARE: Fast Low-rank Attention Routing Engine
-            vg = F.scaled_dot_product_attention(qg, k, v, scale=1.0)
-            y = F.scaled_dot_product_attention(q, kg, vg, scale=1.0)
+            vg1 = F.scaled_dot_product_attention(qg1, k, v, scale=1.0)
+            y = F.scaled_dot_product_attention(
+                q,
+                torch.cat([kg1, kg2], dim=-2),
+                torch.cat([vg1, vg2], dim=-2),
+                scale=1.0,
+            )
 
             out_x = y.permute(0, 2, 1, 3)  # [B, N, H, D]
             out_x = rearrange(out_x, "b n h d -> b n (h d)")
@@ -592,6 +661,145 @@ class LatentAttention_QGGK(nn.Module):
             return self.out_dropout(out_x)
 
 
+class LatentAttention_QGkGK(nn.Module):
+    """
+    Specialization of PhysicsAttention to Irregular Meshes
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dim_head=64,
+        dropout=0.0,
+        slice_num=64,
+        n_global_feat=128,
+        use_te=True,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = dim_head * heads
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.qkv = nn.Linear(dim_head, 3 * dim_head)
+
+        self.x_global = nn.Parameter(torch.randn(1, heads, n_global_feat, dim_head))
+
+        self.out_linear = nn.Linear(inner_dim, dim)
+        self.out_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+
+        Input x should have shape of [Batch, N_tokens, N_Channels] ([B, N, C])
+        """
+
+        with record_function("forward"):
+            x_mid = self.in_project_x(x)
+            x_mid = rearrange(
+                x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
+            )
+            x_mid = x_mid.permute(0, 2, 1, 3)  # [B, H, N, D]
+            qkv = self.qkv(x_mid)
+            qkv = rearrange(qkv, " B h N (t d) -> B h N t d", t=3, d=self.dim_head)
+            q, k, v = qkv.unbind(-2)
+
+            # Option 7: FLARE: Fast Low-rank Attention Routing Engine
+            G = self.x_global
+            z = F.scaled_dot_product_attention(G, k, v, scale=1.0)
+
+            ### y = F.scaled_dot_product_attention(q, G, z, scale=1.0)
+            scaling_factor = 1.0  # math.sqrt(self.dim_head)
+            # score of each node with the global features
+            global_scores = (q @ G.transpose(-2, -1)) / scaling_factor
+            # score of each node with itself
+            local_scores = (q * k).sum(dim=-1, keepdim=True) / scaling_factor
+            scores = torch.cat([global_scores, local_scores], dim=-1)
+            attn = scores.softmax(dim=-1)
+            global_attn = attn[..., :-1]
+            local_attn = attn[..., -1:]
+            # combine global and local features
+            y = (global_attn @ z) + local_attn * v
+
+            out_x = y.permute(0, 2, 1, 3)  # [B, N, H, D]
+            out_x = rearrange(out_x, "b n h d -> b n (h d)")
+            out_x = self.out_linear(out_x)
+            return self.out_dropout(out_x)
+
+
+class Attention_QGtopkGK(nn.Module):
+    """
+    Specialization of PhysicsAttention to Irregular Meshes
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dim_head=64,
+        dropout=0.0,
+        slice_num=64,
+        n_global_feat=64,
+        use_te=True,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.n_global_feat = n_global_feat
+        inner_dim = dim_head * heads
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.qkv = nn.Linear(dim_head, 3 * dim_head)
+
+        self.x_global = nn.Parameter(torch.randn(1, heads, n_global_feat, dim_head))
+
+        self.out_linear = nn.Linear(inner_dim, dim)
+        self.out_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+
+        Input x should have shape of [Batch, N_tokens, N_Channels] ([B, N, C])
+        """
+
+        with record_function("forward"):
+            x_mid = self.in_project_x(x)
+            x_mid = rearrange(
+                x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
+            )
+            x_mid = x_mid.permute(0, 2, 1, 3)  # [B, H, N, D]
+            qkv = self.qkv(x_mid)
+            qkv = rearrange(qkv, " B h N (t d) -> B h N t d", t=3, d=self.dim_head)
+            q, k, v = qkv.unbind(-2)
+
+            # top-k key
+            topk_idx = torch.topk(
+                torch.linalg.norm(k, dim=-1), k=self.n_global_feat, dim=-1
+            )[1]
+            ktopk = torch.gather(
+                k, -2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, k.shape[-1])
+            )  # [B, H, K, D]
+            vtopk = torch.gather(
+                v, -2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, k.shape[-1])
+            )  # [B, H, K, D]
+
+            # Option 7: FLARE: Fast Low-rank Attention Routing Engine
+            G = self.x_global
+            z = F.scaled_dot_product_attention(G, k, v, scale=1.0)
+            y = F.scaled_dot_product_attention(
+                q,
+                torch.cat([G, ktopk], dim=-2),
+                torch.cat([z, vtopk], dim=-2),
+                scale=1.0,
+            )
+
+            out_x = y.permute(0, 2, 1, 3)  # [B, N, H, D]
+            out_x = rearrange(out_x, "b n h d -> b n (h d)")
+            out_x = self.out_linear(out_x)
+            return self.out_dropout(out_x)
+
+
 class LatentAttention_QGGK_Gorth(nn.Module):
     """
     Specialization of PhysicsAttention to Irregular Meshes
@@ -643,115 +851,6 @@ class LatentAttention_QGGK_Gorth(nn.Module):
             q, k, v = qkv.unbind(-2)
 
             # Option 7:
-            G = (
-                torch.stack([self.x_global[i].weight for i in range(self.heads)], dim=0)
-                .unsqueeze(0)
-                .to(q.device)
-            )  # TODO Make it GPU compatable
-            G = G * self.col_norms**2
-            # FLARE: Fast Low-rank Attention Routing Engine
-            z = F.scaled_dot_product_attention(G, k, v, scale=1.0)
-            y = F.scaled_dot_product_attention(q, G, z, scale=1.0)
-
-            out_x = y.permute(0, 2, 1, 3)  # [B, N, H, D]
-            out_x = rearrange(out_x, "b n h d -> b n (h d)")
-            out_x = self.out_linear(out_x)
-            return self.out_dropout(out_x)
-
-
-class LatentAttention(nn.Module):
-    """
-    Specialization of PhysicsAttention to Irregular Meshes
-    """
-
-    def __init__(
-        self,
-        dim,
-        heads=8,
-        dim_head=64,
-        dropout=0.0,
-        slice_num=64,
-        n_global_feat=128,
-        use_te=True,
-    ):
-        super().__init__()
-        self.heads = heads
-        self.dim_head = dim_head
-        inner_dim = dim_head * heads
-        self.in_project_x = nn.Linear(dim, inner_dim)
-        self.qkv = nn.Linear(dim_head, 3 * dim_head)
-
-        # self.x_global = nn.Parameter(torch.randn(1, heads, n_global_feat, dim_head))
-        # self.x_global = torch.nn.utils.parametrizations.orthogonal(nn.Linear(dim_head, n_global_feat, bias=False), "weight")
-        self.x_global = [
-            torch.nn.utils.parametrizations.orthogonal(
-                nn.Linear(dim_head, n_global_feat, bias=False), "weight"
-            )
-            for _ in range(heads)
-        ]
-        # self.qk_global = nn.Linear(dim_head, 2 * dim_head)
-        self.col_norms = nn.Parameter(torch.ones(1, heads, 1, dim_head))
-
-        self.out_linear = nn.Linear(inner_dim, dim)
-        self.out_dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass
-
-        Input x should have shape of [Batch, N_tokens, N_Channels] ([B, N, C])
-        """
-
-        with record_function("forward"):
-            x_mid = self.in_project_x(x)
-            x_mid = rearrange(
-                x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
-            )
-            x_mid = x_mid.permute(0, 2, 1, 3)  # [B, H, N, D]
-            qkv = self.qkv(x_mid)
-            qkv = rearrange(qkv, " B h N (t d) -> B h N t d", t=3, d=self.dim_head)
-            q, k, v = qkv.unbind(-2)
-
-            # # option 1: Winner
-            # qkg = self.qk_global(self.x_global)
-            # qkg = rearrange(qkg, " B h N (t d) -> B h N t d", t=2, d=self.dim_head)
-            # qg, kg = qkg.unbind(-2)
-
-            # # # option 2:
-            # # x_global = F.scaled_dot_product_attention(self.x_global, x_mid, x_mid, scale=1.0)
-            # # qkg = self.qk_global(x_global)
-            # # qkg = rearrange(qkg, " B h N (t d) -> B h N t d", t=2, d=self.dim_head)
-            # # qg, kg = qkg.unbind(-2)
-
-            # # # option 3:
-            # # qg = F.scaled_dot_product_attention(self.x_global, k, q, scale=1.0)
-            # # kg = F.scaled_dot_product_attention(self.x_global, k, k, scale=1.0)
-
-            # # # option 4:
-            # # topk = torch.topk(torch.linalg.norm(q, dim=-1), k=128, dim=-1)
-            # # qg = torch.gather(q, -2, topk[1].unsqueeze(-1).expand(-1,-1,-1,q.shape[-1])) # [B, H, K, D]
-            # # kg = torch.gather(k, -2, topk[1].unsqueeze(-1).expand(-1,-1,-1,k.shape[-1])) # [B, H, K, D]
-
-            # # # option 5:
-            # # topk = torch.topk(torch.linalg.norm(q, dim=-1), k=128, dim=-1, largest=False)
-            # # qg = torch.gather(q, -2, topk[1].unsqueeze(-1).expand(-1,-1,-1,q.shape[-1])) # [B, H, K, D]
-            # # kg = torch.gather(k, -2, topk[1].unsqueeze(-1).expand(-1,-1,-1,k.shape[-1])) # [B, H, K, D]
-
-            # # # option 6: min and max
-            # # topkMax = torch.topk(torch.linalg.norm(q, dim=-1), k=64, dim=-1, largest=True)
-            # # topkMin = torch.topk(torch.linalg.norm(q, dim=-1), k=64, dim=-1, largest=False)
-            # # topk = torch.cat([topkMax[1], topkMin[1]], dim=-1)
-            # # qg = torch.gather(q, -2, topk.unsqueeze(-1).expand(-1,-1,-1,q.shape[-1])) # [B, H, K, D]
-            # # kg = torch.gather(k, -2, topk.unsqueeze(-1).expand(-1,-1,-1,k.shape[-1])) # [B, H, K, D]
-
-            # # FLARE: Fast Low-rank Attention Routing Engine
-            # vg = F.scaled_dot_product_attention(qg, k,  v,  scale=1.0)
-            # y  = F.scaled_dot_product_attention(q,  kg, vg, scale=1.0)
-
-            # Option 7:
-            # G = torch.linalg.qr(self.x_global.to('cpu'), mode="reduced")[0].to(q.device)
-            # G = deterministic_orthonormal_columns(self.x_global)
-            # G = self.x_global.weight[None, None, :, :].expand(-1, 8, -1, -1) # TODO Make it GPU compatable
             G = (
                 torch.stack([self.x_global[i].weight for i in range(self.heads)], dim=0)
                 .unsqueeze(0)
