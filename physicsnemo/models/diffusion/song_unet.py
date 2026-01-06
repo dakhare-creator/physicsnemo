@@ -25,7 +25,9 @@ import torch
 from torch.nn.functional import silu
 from torch.utils.checkpoint import checkpoint
 
-from physicsnemo.models.diffusion import (
+from physicsnemo.core.meta import ModelMetaData
+from physicsnemo.core.module import Module
+from physicsnemo.models.diffusion.layers import (
     Conv2d,
     FourierEmbedding,
     Linear,
@@ -34,8 +36,6 @@ from physicsnemo.models.diffusion import (
     get_group_norm,
 )
 from physicsnemo.models.diffusion.utils import _recursive_property
-from physicsnemo.models.meta import ModelMetaData
-from physicsnemo.models.module import Module
 
 # ------------------------------------------------------------------------------
 # Backbone architectures
@@ -44,7 +44,6 @@ from physicsnemo.models.module import Module
 
 @dataclass
 class MetaData(ModelMetaData):
-    name: str = "SongUNet"
     # Optimization
     jit: bool = False
     cuda_graphs: bool = False
@@ -234,7 +233,7 @@ class SongUNet(Module):
           architectures. Despite the name, these embeddings encode temporal information about the
           diffusion process rather than spatial position information.
         • Limitations on input image resolution: for a model that has :math:`N` levels,
-          the latent state :math:`\mathbf{x}` must have resolution that is a multiple of :math:`2^N` in each dimension.
+          the latent state :math:`\mathbf{x}` must have resolution that is a multiple of :math:`2^{N-1}` in each dimension.
           This is due to a limitation in the decoder that does not support shape mismatch
           in the residual connections from the encoder to the decoder. For images that do not match
           this requirement, it is recommended to interpolate your data on a grid of the required resolution
@@ -337,7 +336,7 @@ class SongUNet(Module):
             self.img_shape_x = img_resolution[1]
 
         self._num_levels = len(channel_mult)
-        self._input_shape_mult = 2**self._num_levels
+        self._input_shape_mult = 2 ** (self._num_levels - 1)
 
         # set the threshold for checkpointing based on image resolution
         self.checkpoint_threshold = (
@@ -534,7 +533,7 @@ class SongUNet(Module):
                     f"got {x.ndim}D tensor with shape {tuple(x.shape)}"
                 )
 
-            # Check spatial dimensions are powers of 2 or multiples of 2^N
+            # Check spatial dimensions are powers of 2 or multiples of 2^{N-1}
             for d in x.shape[-2:]:
                 # Check if d is a power of 2
                 is_power_of_2 = (d & (d - 1)) == 0 and d > 0
@@ -545,7 +544,7 @@ class SongUNet(Module):
                 ):
                     raise ValueError(
                         f"Input spatial dimensions ({x.shape[-2:]}) must be "
-                        f"either powers of 2 or multiples of 2**N where "
+                        f"either powers of 2 or multiples of 2**(N-1) where "
                         f"N (={self._num_levels}) is the number of levels "
                         f"in the U-Net."
                     )
@@ -815,7 +814,7 @@ class SongUNetPosEmbd(SongUNet):
     --------
     >>> import torch
     >>> from physicsnemo.models.diffusion.song_unet import SongUNetPosEmbd
-    >>> from physicsnemo.utils.patching import GridPatching2D
+    >>> from physicsnemo.models.diffusion.patching import GridPatching2D
     >>>
     >>> # Model initialization - in_channels must include both original input channels (2)
     >>> # and the positional embedding channels (N_grid_channels=4 by default)
@@ -1048,7 +1047,7 @@ class SongUNetPosEmbd(SongUNet):
         Example
         -------
         >>> # Create global indices using patching utility:
-        >>> from physicsnemo.utils.patching import GridPatching2D
+        >>> from physicsnemo.models.diffusion.patching import GridPatching2D
         >>> patching = GridPatching2D(img_shape=(16, 16), patch_shape=(8, 8))
         >>> global_index = patching.global_index(batch_size=3)
         >>> print(global_index.shape)
@@ -1062,9 +1061,9 @@ class SongUNetPosEmbd(SongUNet):
               Patches are processed independently by the model, and the ``global_index`` parameter
               is used to select the grid of positional embeddings corresponding
               to each patch.
-            - See this method from :class:`physicsnemo.utils.patching.BasePatching2D`
+            - See this method from :class:`physicsnemo.models.diffusion.patching.BasePatching2D`
               for generating the ``global_index`` parameter:
-              :meth:`~physicsnemo.utils.patching.BasePatching2D.global_index`.
+              :meth:`~physicsnemo.models.diffusion.patching.BasePatching2D.global_index`.
         """
 
         # dtype casting of embeddings
@@ -1188,7 +1187,7 @@ class SongUNetPosEmbd(SongUNet):
             Each selected embedding should correspond to the portion of the embedding grid
             that corresponds to the batch element in ``x``.
             Typically this should be based on
-            :meth:`physicsnemo.utils.patching.BasePatching2D.apply` method to
+            :meth:`physicsnemo.models.diffusion.patching.BasePatching2D.apply` method to
             maintain consistency with patch extraction.
         lead_time_label : Optional[torch.Tensor], default=None
             Tensor of shape :math:`(B,)` that corresponds to the lead-time
@@ -1211,15 +1210,15 @@ class SongUNetPosEmbd(SongUNet):
               to select the grid of positional embeddings corresponding to each
               patch.
             - See the method
-              :meth:`~physicsnemo.utils.patching.BasePatching2D.apply` from
-              :class:`physicsnemo.utils.patching.BasePatching2D` for generating
+              :meth:`~physicsnemo.models.diffusion.patching.BasePatching2D.apply` from
+              :class:`physicsnemo.models.diffusion.patching.BasePatching2D` for generating
               the ``embedding_selector`` parameter, as well as the example
               below.
 
         Example
         -------
         >>> # Define a selector function with a patching utility:
-        >>> from physicsnemo.utils.patching import GridPatching2D
+        >>> from physicsnemo.models.diffusion.patching import GridPatching2D
         >>> patching = GridPatching2D(img_shape=(16, 16), patch_shape=(8, 8))
         >>> B = 4
         >>> def embedding_selector(emb):
@@ -1436,7 +1435,7 @@ class SongUNetPosLtEmbd(SongUNetPosEmbd):
     --------
     >>> import torch
     >>> from physicsnemo.models.diffusion.song_unet import SongUNetPosLtEmbd
-    >>> from physicsnemo.utils.patching import GridPatching2D
+    >>> from physicsnemo.models.diffusion.patching import GridPatching2D
     >>>
     >>> # Model initialization - in_channels must include original input channels (2),
     >>> # positional embedding channels (N_grid_channels=4 by default) and
