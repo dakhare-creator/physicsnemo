@@ -14,20 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-_target_: rollout.TransolverAutoregressiveRolloutTraining_flareX
-_convert_: all
-
-functional_dim: 4
-embedding_dim: 3
-out_dim: 3
-slice_num: 128
-n_layers: 6
-unified_pos: false
-structured_shape: null
-use_te: false
-time_input: false
-### Rollout parameters ###
-num_time_steps: ${training.num_time_steps}
-dt: 5e-3
-initial_vel: 9.22
-attention_type: "LatentAttention_QGGK"
+from .transolver_crash import Transolver_crash
+from .transolver_flare import Transolver_flare

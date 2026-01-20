@@ -14,20 +14,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-_target_: rollout.TransolverAutoregressiveRolloutTraining_flareX
+_target_: rollout.GeoTransolverAutoregressiveRolloutTraining
 _convert_: all
 
-functional_dim: 4
-embedding_dim: 3
+functional_dim: 7
+# global_dim: 2
+geometry_dim: 3
 out_dim: 3
-slice_num: 128
 n_layers: 6
-unified_pos: false
-structured_shape: null
+n_hidden: 256
+dropout: 0.0
+n_head: 8
+act: "gelu"
+mlp_ratio: 2
+slice_num: 128
 use_te: false
-time_input: false
+plus: false
+include_local_features: true # use local features
+# include_local_features: false # use local features
+radii: [0.05, 0.25, 1.0, 2.5] # radius for local features
+neighbors_in_radius: [8, 32, 64, 128] # neighbors in radius for local features
+n_hidden_local: 32 # hidden dimension for local features
+attention_type: "GALE"
+
 ### Rollout parameters ###
 num_time_steps: ${training.num_time_steps}
 dt: 5e-3
 initial_vel: 9.22
-attention_type: "LatentAttention_QGGK"

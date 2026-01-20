@@ -31,5 +31,3 @@ SOFTWARE.
 """
 
 from .transolver import Transolver
-from .transolver_crash import Transolver_crash
-from .transolver_flare import Transolver_flare
