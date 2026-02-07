@@ -35,6 +35,8 @@ from physicsnemo.nn.module.physics_attention import (
     PhysicsAttentionIrregularMesh,
 )
 
+from physicsnemo.experimental.models.geotransolver.gaflare import GAFLARE
+
 # Check optional dependency availability
 TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False)
 if TE_AVAILABLE:
@@ -369,6 +371,7 @@ class GALE_block(nn.Module):
         use_te: bool = True,
         plus: bool = False,
         context_dim: int = 0,
+        attention_type: str = "GALE",
     ) -> None:
         super().__init__()
 
@@ -387,7 +390,8 @@ class GALE_block(nn.Module):
             self.ln_1 = nn.LayerNorm(hidden_dim)
 
         # GALE attention layer
-        self.Attn = GALE(
+        if attention_type in globals():
+            self.Attn = globals()[attention_type](
             hidden_dim,
             heads=num_heads,
             dim_head=hidden_dim // num_heads,

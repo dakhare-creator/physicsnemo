@@ -315,6 +315,7 @@ class GeoTransolver(Module):
         radii: list[float] | None = None,
         neighbors_in_radius: list[int] | None = None,
         n_hidden_local: int = 32,
+        attention_type: str = "GALE",
     ) -> None:
         super().__init__(meta=GeoTransolverMetaData())
         self.__name__ = "GeoTransolver"
@@ -404,6 +405,7 @@ class GeoTransolver(Module):
                     use_te=use_te,
                     plus=plus,
                     context_dim=context_dim,
+                    attention_type=attention_type,
                 )
                 for layer_idx in range(n_layers)
             ]
