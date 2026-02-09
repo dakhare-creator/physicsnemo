@@ -14,11 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GALE (Geometry-Aware Latent Embeddings) attention layer and transformer block.
+"""GAFLARE (Geometry-Aware FLARE) attention layer and transformer block.
 
-This module provides the GALE attention mechanism and GALE_block transformer block,
-which extend the Transolver physics attention with cross-attention capabilities for
-geometry and global context embeddings.
+This module provides the GAFLARE attention mechanism, 
+an alternative to the GALE attention mechanism of the GeoTransolver.
 """
 
 from __future__ import annotations
@@ -40,12 +39,15 @@ if TE_AVAILABLE:
 
 class GAFLARE(nn.Module):
     r"""GAFLARE: Geometry-Aware FLARE attention layer.
-    Adopted from FLARE: Fast Low-rank Attention Routing Engine
-    paper: https://arxiv.org/abs/2508.12594
+    Adopted:
+    - FLARE attention: Fast Low-rank Attention Routing Engine
+        paper: https://arxiv.org/abs/2508.12594
+    - GeoTransolver context:
+        paper: https://arxiv.org/abs/2512.20399
 
-    This is an alternative to the GALE attention mechanism of the GeoTransolver 
+    GAFLARE is an alternative to the GALE attention mechanism of the GeoTransolver 
     It support cross-attention with a context vector, built from geometry and global embeddings.
-    GALE combines self-attention on learned physical state slices with cross-attention
+    GAFLARE combines self-attention on learned physical state slices with cross-attention
     to geometry-aware context, using a learnable mixing weight to blend the two.
 
     Parameters
@@ -61,7 +63,7 @@ class GAFLARE(nn.Module):
     slice_num : int, optional
         Number of learned queries. Default is 64.
     use_te : bool, optional
-        Whether to use Transformer Engine backend when available. Default is True.
+        Whether to use Transformer Engine backend when available. Default is False.
     context_dim : int, optional
         Dimension of the context vector for cross-attention. Default is 0.
 
@@ -89,16 +91,16 @@ class GAFLARE(nn.Module):
 
     See Also
     --------
-    :class:`physicsnemo.models.transolver.Physics_Attention.PhysicsAttentionIrregularMesh` : Base physics attention class.
-    :class:`GALE_block` : Transformer block using GALE attention.
+    :class:`GALE` : Origional GeoTransolver GALE attention class.
+    :class:`GALE_block` : Transformer block using GAFLARE attention.
 
     Examples
     --------
     >>> import torch
-    >>> gale = GALE(dim=256, heads=8, dim_head=32, context_dim=32)
+    >>> gaflare = GAFLARE(dim=256, heads=8, dim_head=32, context_dim=32)
     >>> x = (torch.randn(2, 100, 256),)  # Single input tensor in tuple
     >>> context = torch.randn(2, 8, 64, 32)  # Context for cross-attention
-    >>> outputs = gale(x, context)
+    >>> outputs = gaflare(x, context)
     >>> len(outputs)
     1
     >>> outputs[0].shape
@@ -194,7 +196,6 @@ class GAFLARE(nn.Module):
         v = [self.self_v(_x_mid) for _x_mid in x_mid]
 
         # FLARE: Self Attention
-        # Compute cross-attention using appropriate backend
         if self.use_te:
             # Transformer Engine expects (B, S, H, D) format
             G = [rearrange(_G, "b h s d -> b s h d") for _G in G]
@@ -209,9 +210,6 @@ class GAFLARE(nn.Module):
             # Use PyTorch's scaled dot-product attention
             z = [F.scaled_dot_product_attention(_G, _k, _v, scale=1.0) for _G, _k, _v in zip(G, k, v)]
             self_attention = [F.scaled_dot_product_attention(_k, _G, _z, scale=1.0) for _k, _G, _z in zip(k, G, z)]
-
-        # z = [F.scaled_dot_product_attention(_G, _k, _v, scale=1.0) for _G, _k, _v in zip(G, k, v)]
-        # ys = [F.scaled_dot_product_attention(_k, _G, _z, scale=1.0) for _k, _G, _z in zip(k, G, z)]
 
         # apply cross-attention with physical states:
         if context is not None:
