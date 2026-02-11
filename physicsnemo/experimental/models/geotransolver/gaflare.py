@@ -91,7 +91,7 @@ class GAFLARE(nn.Module):
 
     See Also
     --------
-    :class:`GALE` : Origional GeoTransolver GALE attention class.
+    :class:`GALE` : Original GeoTransolver GALE attention class.
     :class:`GALE_block` : Transformer block using GAFLARE attention.
 
     Examples
@@ -119,7 +119,7 @@ class GAFLARE(nn.Module):
         **kwargs,
     ):
         self.use_te = False # te will disable FlashAttention for different size of q and k
-        self.scale = 1. #dim_head**-0.5
+        self.scale = 1.     # FLARE scale is 1.0
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
