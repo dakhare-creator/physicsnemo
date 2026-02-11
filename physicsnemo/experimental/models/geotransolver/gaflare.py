@@ -141,7 +141,7 @@ class GAFLARE(nn.Module):
         self.cross_v = linear_layer(context_dim, dim_head)
 
         # te attention
-        if use_te:
+        if self.use_te:
             self.attn_fn = te.DotProductAttention(
                 num_attention_heads=self.heads,
                 kv_channels=self.dim_head,
@@ -242,3 +242,12 @@ class GAFLARE(nn.Module):
         outputs = [rearrange(_out, "b n h d -> b n (h d)") for _out in outputs]
         outputs = [self.out_linear(_out) for _out in outputs]
         return [self.out_dropout(_out) for _out in outputs]
+
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    x = (torch.randn(2, 100, 256).to(device),)
+    context = torch.randn(2, 8, 64, 32).to(device)
+    gaflare = GAFLARE(dim=256, heads=8, dim_head=32, context_dim=32).to(device)
+    outputs = gaflare(x, context)
+    print(outputs[0].shape)
