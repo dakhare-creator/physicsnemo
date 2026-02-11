@@ -118,7 +118,8 @@ class GAFLARE(nn.Module):
         context_dim: int = 0,
         **kwargs,
     ):
-        self.use_te = False # TODO: remove this (Needs to be tested)
+        self.use_te = False # te will disable FlashAttention for different size of q and k
+        self.scale = 1. #dim_head**-0.5
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
@@ -146,7 +147,7 @@ class GAFLARE(nn.Module):
                 kv_channels=self.dim_head,
                 attention_dropout=dropout,
                 qkv_format="bshd",
-                softmax_scale=self.scale,
+                softmax_scale=self.scale
             )
 
         # Linear projection for output
@@ -191,7 +192,7 @@ class GAFLARE(nn.Module):
             _x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
         ) for _x_mid in x_mid]
         x_mid = [_x_mid.permute(0, 2, 1, 3) for _x_mid in x_mid]  # [B, H, N, D]
-        G = [self.q_global] * len(x) 
+        G = [self.q_global.to(dtype=x_mid[0].dtype)] * len(x) 
         k = [self.self_k(_x_mid) for _x_mid in x_mid]
         v = [self.self_v(_x_mid) for _x_mid in x_mid]
 
@@ -202,10 +203,13 @@ class GAFLARE(nn.Module):
             k = [rearrange(_k, "b h s d -> b s h d") for _k in k]
             v = [rearrange(_v, "b h s d -> b s h d") for _v in v]
             z = [self.attn_fn(_G, _k, _v) for _G, _k, _v in zip(G, k, v)]
+            z = [rearrange(
+                _z, "b s (h d) -> b s h d", h=self.heads, d=self.dim_head
+            ) for _z in z]
             self_attention = [self.attn_fn(_k, _G, _z) for _k, _G, _z in zip(k, G, z)]
-            self_attention = rearrange(
-                self_attention, "b s (h d) -> b h s d", h=self.heads, d=self.dim_head
-            )
+            self_attention = [rearrange(
+                _self_attention, "b s (h d) -> b h s d", h=self.heads, d=self.dim_head
+            ) for _self_attention in self_attention]
         else:
             # Use PyTorch's scaled dot-product attention
             z = [F.scaled_dot_product_attention(_G, _k, _v, scale=1.0) for _G, _k, _v in zip(G, k, v)]
@@ -214,20 +218,19 @@ class GAFLARE(nn.Module):
         # apply cross-attention with physical states:
         if context is not None:
             q = [self.cross_q(_x_mid) for _x_mid in x_mid]
-            k = [self.cross_k(_context) for _context in context]
-            v = [self.cross_v(_context) for _context in context]
-            # yc = [F.scaled_dot_product_attention(_q, _k, _v, scale=1.0) for _q, _k, _v in zip(q, k, v)]
+            k = self.cross_k(context)
+            v = self.cross_v(context)
 
             if self.use_te:
                 q = [rearrange(_q, "b h s d -> b s h d") for _q in q]
-                k = [rearrange(_k, "b h s d -> b s h d") for _k in k]
-                v = [rearrange(_v, "b h s d -> b s h d") for _v in v]
-                cross_attention = [self.attn_fn(_q, _k, _v) for _q, _k, _v in zip(q, k, v)]
-                cross_attention = rearrange(
-                    cross_attention, "b s (h d) -> b h s d", h=self.heads, d=self.dim_head
-                )
+                k = rearrange(k, "b h s d -> b s h d")
+                v = rearrange(v, "b h s d -> b s h d")
+                cross_attention = [self.attn_fn(_q, k, v) for _q in q]
+                cross_attention = [rearrange(
+                    _cross_attention, "b s (h d) -> b h s d", h=self.heads, d=self.dim_head
+                ) for _cross_attention in cross_attention]
             else:
-                cross_attention = [F.scaled_dot_product_attention(_q, _k, _v, scale=1.0) for _q, _k, _v in zip(q, k, v)]
+                cross_attention = [F.scaled_dot_product_attention(_q, k, v, scale=1.0) for _q in q]
 
             # Apply learnable mixing:
             mixing_weight = torch.sigmoid(self.state_mixing)
