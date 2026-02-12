@@ -28,13 +28,11 @@ import torch.nn.functional as F
 from einops import rearrange
 from jaxtyping import Float
 
-import physicsnemo  # noqa: F401 for docs
-from physicsnemo.core.version_check import check_version_spec
+from physicsnemo.core.version_check import check_version_spec, OptionalImport
 
 # Check optional dependency availability
 TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False)
-if TE_AVAILABLE:
-    import transformer_engine.pytorch as te
+te = OptionalImport("transformer_engine.pytorch", "0.1.0")
 
 
 class GAFLARE(nn.Module):
@@ -60,8 +58,8 @@ class GAFLARE(nn.Module):
         Dimension of each attention head. Default is 64.
     dropout : float, optional
         Dropout rate. Default is 0.0.
-    slice_num : int, optional
-        Number of learned queries. Default is 64.
+    n_global_queries : int, optional
+        Number of learned global queries. Default is 64.
     use_te : bool, optional
         Whether to use Transformer Engine backend when available. Default is False.
     context_dim : int, optional
@@ -113,10 +111,9 @@ class GAFLARE(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
-        slice_num: int = 64,
+        n_global_queries: int = 64,
         use_te: bool = True,
         context_dim: int = 0,
-        **kwargs,
     ):
         self.use_te = False # te will disable FlashAttention for different size of q and k
         self.scale = 1.     # FLARE scale is 1.0
@@ -128,7 +125,7 @@ class GAFLARE(nn.Module):
         linear_layer = te.Linear if self.use_te else nn.Linear
 
         # Global queries for FLARE self-attention
-        self.q_global = nn.Parameter(torch.randn(1, heads, slice_num, dim_head))
+        self.q_global = nn.Parameter(torch.randn(1, heads, n_global_queries, dim_head))
 
         # Linear projections for self-attention
         self.in_project_x = linear_layer(dim, inner_dim)
@@ -243,11 +240,3 @@ class GAFLARE(nn.Module):
         outputs = [self.out_linear(_out) for _out in outputs]
         return [self.out_dropout(_out) for _out in outputs]
 
-
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    x = (torch.randn(2, 100, 256).to(device),)
-    context = torch.randn(2, 8, 64, 32).to(device)
-    gaflare = GAFLARE(dim=256, heads=8, dim_head=32, context_dim=32).to(device)
-    outputs = gaflare(x, context)
-    print(outputs[0].shape)

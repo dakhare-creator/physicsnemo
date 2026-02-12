@@ -29,7 +29,7 @@ from einops import rearrange
 from jaxtyping import Float
 
 import physicsnemo  # noqa: F401 for docs
-from physicsnemo.core.version_check import check_version_spec
+from physicsnemo.core.version_check import check_version_spec, OptionalImport
 from physicsnemo.nn import Mlp
 from physicsnemo.nn.module.physics_attention import (
     PhysicsAttentionIrregularMesh,
@@ -39,8 +39,7 @@ from physicsnemo.experimental.models.geotransolver.gaflare import GAFLARE
 
 # Check optional dependency availability
 TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False)
-if TE_AVAILABLE:
-    import transformer_engine.pytorch as te
+te = OptionalImport("transformer_engine.pytorch", "0.1.0")
 
 
 class GALE(PhysicsAttentionIrregularMesh):
@@ -389,18 +388,29 @@ class GALE_block(nn.Module):
         else:
             self.ln_1 = nn.LayerNorm(hidden_dim)
 
-        # GALE attention layer
-        if attention_type in globals():
-            self.Attn = globals()[attention_type](
-            hidden_dim,
-            heads=num_heads,
-            dim_head=hidden_dim // num_heads,
-            dropout=dropout,
-            slice_num=slice_num,
-            use_te=use_te,
-            plus=plus,
-            context_dim=context_dim,
-        )
+        # Attention layer
+        match attention_type:
+            case 'GALE':
+                self.Attn = GALE(
+                    hidden_dim,
+                    heads=num_heads,
+                    dim_head=hidden_dim // num_heads,
+                    dropout=dropout,
+                    slice_num=slice_num,
+                    use_te=use_te,
+                    plus=plus,
+                    context_dim=context_dim,
+                )
+            case 'GAFLARE':
+                self.Attn = GAFLARE(
+                    hidden_dim,
+                    heads=num_heads,
+                    dim_head=hidden_dim // num_heads,
+                    dropout=dropout,
+                    n_global_queries=slice_num,
+                    use_te=use_te,
+                    context_dim=context_dim,
+                )
 
         # Feed-forward network with layer normalization
         if use_te:
