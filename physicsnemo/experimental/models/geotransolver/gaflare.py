@@ -44,7 +44,7 @@ class GAFLARE(nn.Module):
         paper: https://arxiv.org/abs/2512.20399
 
     GAFLARE is an alternative to the GALE attention mechanism of the GeoTransolver 
-    It support cross-attention with a context vector, built from geometry and global embeddings.
+    It supports cross-attention with a context vector, built from geometry and global embeddings.
     GAFLARE combines self-attention on learned physical state slices with cross-attention
     to geometry-aware context, using a learnable mixing weight to blend the two.
 
@@ -90,7 +90,7 @@ class GAFLARE(nn.Module):
     See Also
     --------
     :class:`GALE` : Original GeoTransolver GALE attention class.
-    :class:`GALE_block` : Transformer block using GAFLARE attention.
+    :class:`GALE_block` : Transformer block that calls GALE or GAFLARE attention.
 
     Examples
     --------
@@ -115,7 +115,12 @@ class GAFLARE(nn.Module):
         use_te: bool = True,
         context_dim: int = 0,
     ):
-        self.use_te = False # te will disable FlashAttention for different size of q and k
+        if use_te:
+            raise ValueError(
+                "GAFLARE does not support Transformer Engine backend. "
+                "Use use_te=False; TE disables FlashAttention for differing q/k sizes in FLARE attention."
+            )
+        self.use_te = use_te
         self.scale = 1.     # FLARE scale is 1.0
         super().__init__()
         self.heads = heads
@@ -132,10 +137,14 @@ class GAFLARE(nn.Module):
         self.self_k = linear_layer(dim_head, dim_head)
         self.self_v = linear_layer(dim_head, dim_head)
 
-        # Linear projections for cross-attention
-        self.cross_q = linear_layer(dim_head, dim_head)
-        self.cross_k = linear_layer(context_dim, dim_head)
-        self.cross_v = linear_layer(context_dim, dim_head)
+        if context_dim > 0:
+            # Linear projections for cross-attention
+            self.cross_q = linear_layer(dim_head, dim_head)
+            self.cross_k = linear_layer(context_dim, dim_head)
+            self.cross_v = linear_layer(context_dim, dim_head)
+
+            # Learnable mixing weight between self and cross attention
+            self.state_mixing = nn.Parameter(torch.tensor(0.0))
 
         # te attention
         if self.use_te:
@@ -151,8 +160,6 @@ class GAFLARE(nn.Module):
         self.out_linear = linear_layer(inner_dim, dim)
         self.out_dropout = nn.Dropout(dropout)
 
-        # Learnable mixing weight between self and cross attention
-        self.state_mixing = nn.Parameter(torch.tensor(0.0))
 
     def forward(
         self,
