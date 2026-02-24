@@ -120,11 +120,11 @@ class GAFLARE(nn.Module):
                 "GAFLARE does not support Transformer Engine backend. "
                 "Use use_te=False; TE disables FlashAttention for differing q/k sizes in FLARE attention."
             )
-        self.use_te = use_te
-        self.scale = 1.     # FLARE scale is 1.0
         super().__init__()
+        self.use_te = use_te
         self.heads = heads
         self.dim_head = dim_head
+        self.scale = 1 if self.dim_head <= 8 else (self.dim_head ** -0.5)
         inner_dim = dim_head * heads
 
         linear_layer = te.Linear if self.use_te else nn.Linear
@@ -196,7 +196,7 @@ class GAFLARE(nn.Module):
             _x_mid, "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
         ) for _x_mid in x_mid]
         x_mid = [_x_mid.permute(0, 2, 1, 3) for _x_mid in x_mid]  # [B, H, N, D]
-        G = [self.q_global.to(dtype=x_mid[0].dtype)] * len(x) 
+        G = [self.q_global.to(dtype=x_mid[0].dtype).expand(x_mid[0].shape[0], -1, -1, -1)] * len(x) 
         k = [self.self_k(_x_mid) for _x_mid in x_mid]
         v = [self.self_v(_x_mid) for _x_mid in x_mid]
 
@@ -216,8 +216,8 @@ class GAFLARE(nn.Module):
             ) for _self_attention in self_attention]
         else:
             # Use PyTorch's scaled dot-product attention
-            z = [F.scaled_dot_product_attention(_G, _k, _v, scale=1.0) for _G, _k, _v in zip(G, k, v)]
-            self_attention = [F.scaled_dot_product_attention(_k, _G, _z, scale=1.0) for _k, _G, _z in zip(k, G, z)]
+            z = [F.scaled_dot_product_attention(_G, _k, _v, scale=self.scale) for _G, _k, _v in zip(G, k, v)]
+            self_attention = [F.scaled_dot_product_attention(_k, _G, _z, scale=self.scale) for _k, _G, _z in zip(k, G, z)]
 
         # apply cross-attention with physical states:
         if context is not None:
@@ -234,7 +234,7 @@ class GAFLARE(nn.Module):
                     _cross_attention, "b s (h d) -> b h s d", h=self.heads, d=self.dim_head
                 ) for _cross_attention in cross_attention]
             else:
-                cross_attention = [F.scaled_dot_product_attention(_q, k, v, scale=1.0) for _q in q]
+                cross_attention = [F.scaled_dot_product_attention(_q, k, v, scale=self.scale) for _q in q]
 
             # Apply learnable mixing:
             mixing_weight = torch.sigmoid(self.state_mixing)
