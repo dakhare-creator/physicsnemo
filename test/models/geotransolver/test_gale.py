@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
+from physicsnemo.experimental.models.geotransolver.gaflare import GAFLARE
 from physicsnemo.experimental.models.geotransolver.gale import (
     GALE,
     GALE_block,
@@ -129,12 +131,51 @@ def test_gale_forward_multiple_inputs(device):
 
 
 # =============================================================================
+# GAFLARE Attention Tests
+# =============================================================================
+
+
+def test_gaflare_forward_with_context(device):
+    """Test GAFLARE attention forward with cross-attention context."""
+    torch.manual_seed(42)
+
+    dim = 64
+    heads = 4
+    dim_head = 16
+    n_global_queries = 8
+    batch_size = 2
+    n_tokens = 100
+    context_tokens = 32
+    context_dim = dim_head
+
+    gaflare = GAFLARE(
+        dim=dim,
+        heads=heads,
+        dim_head=dim_head,
+        dropout=0.0,
+        n_global_queries=n_global_queries,
+        use_te=False,
+        context_dim=context_dim,
+    ).to(device)
+
+    x = torch.randn(batch_size, n_tokens, dim).to(device)
+    context = torch.randn(batch_size, heads, context_tokens, context_dim).to(device)
+
+    outputs = gaflare((x,), context=context)
+
+    assert len(outputs) == 1
+    assert outputs[0].shape == (batch_size, n_tokens, dim)
+    assert not torch.isnan(outputs[0]).any()
+
+
+# =============================================================================
 # GALE_block Tests
 # =============================================================================
 
 
-def test_gale_block_forward(device):
-    """Test GALE_block transformer block forward pass."""
+@pytest.mark.parametrize("attention_type", ["GALE", "GAFLARE"])
+def test_gale_block_forward(device, attention_type):
+    """Test GALE_block transformer block forward pass (GALE and GAFLARE)."""
     torch.manual_seed(42)
 
     hidden_dim = 64
@@ -156,6 +197,7 @@ def test_gale_block_forward(device):
         use_te=False,
         plus=False,
         context_dim=context_dim,
+        attention_type=attention_type,
     ).to(device)
 
     x = torch.randn(batch_size, n_tokens, hidden_dim).to(device)
