@@ -35,7 +35,7 @@ from physicsnemo.nn.module.physics_attention import (
     PhysicsAttentionIrregularMesh,
 )
 
-from physicsnemo.experimental.models.geotransolver.gaflare import GAFLARE
+from physicsnemo.experimental.models.geotransolver.gale_fa import GAFLARE
 
 # Check optional dependency availability
 TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False)
