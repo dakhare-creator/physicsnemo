@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GAFLARE (Geometry-Aware FLARE) attention layer and transformer block.
+"""GALE_FA (Geometry-Aware Latent Embeddings with FLARE self-Attention) attention layer.
 
-This module provides the GAFLARE attention mechanism, 
+This module provides the GALE_FA attention mechanism, 
 an alternative to the GALE attention mechanism of the GeoTransolver.
 """
 
@@ -35,17 +35,17 @@ TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False
 te = OptionalImport("transformer_engine.pytorch", "0.1.0")
 
 
-class GAFLARE(nn.Module):
-    r"""GAFLARE: Geometry-Aware FLARE attention layer.
+class GALE_FA(nn.Module):
+    r"""GALE_FA: Geometry-Aware Latent Embeddings with FLARE self-Attention attention layer.
     Adopted:
     - FLARE attention: Fast Low-rank Attention Routing Engine
         paper: https://arxiv.org/abs/2508.12594
     - GeoTransolver context:
         paper: https://arxiv.org/abs/2512.20399
 
-    GAFLARE is an alternative to the GALE attention mechanism of the GeoTransolver 
+    GALE_FA is an alternative to the GALE attention mechanism of the GeoTransolver 
     It supports cross-attention with a context vector, built from geometry and global embeddings.
-    GAFLARE combines self-attention on learned physical state slices with cross-attention
+    GALE_FA combines FLARE self-attention on learned physical state slices with cross-attention
     to geometry-aware context, using a learnable mixing weight to blend the two.
 
     Parameters
@@ -90,15 +90,15 @@ class GAFLARE(nn.Module):
     See Also
     --------
     :class:`GALE` : Original GeoTransolver GALE attention class.
-    :class:`GALE_block` : Transformer block that calls GALE or GAFLARE attention.
+    :class:`GALE_block` : Transformer block that calls GALE or GALE_FA attention.
 
     Examples
     --------
     >>> import torch
-    >>> gaflare = GAFLARE(dim=256, heads=8, dim_head=32, context_dim=32)
+    >>> gale_fa = GALE_FA(dim=256, heads=8, dim_head=32, context_dim=32)
     >>> x = (torch.randn(2, 100, 256),)  # Single input tensor in tuple
     >>> context = torch.randn(2, 8, 64, 32)  # Context for cross-attention
-    >>> outputs = gaflare(x, context)
+    >>> outputs = gale_fa(x, context)
     >>> len(outputs)
     1
     >>> outputs[0].shape
@@ -117,7 +117,7 @@ class GAFLARE(nn.Module):
     ):
         if use_te:
             raise ValueError(
-                "GAFLARE does not support Transformer Engine backend. "
+                "GALE_FA does not support Transformer Engine backend. "
                 "Use use_te=False; TE disables FlashAttention for differing q/k sizes in FLARE attention."
             )
         super().__init__()
