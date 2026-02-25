@@ -17,11 +17,11 @@
 import pytest
 import torch
 
+from physicsnemo.experimental.models.geotransolver.gaflare import GAFLARE
 from physicsnemo.experimental.models.geotransolver.gale import (
     GALE,
     GALE_block,
 )
-from physicsnemo.experimental.models.geotransolver.gaflare import GAFLARE
 
 # =============================================================================
 # GALE (Geometry-Aware Latent Embeddings) Attention Tests
