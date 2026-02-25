@@ -318,6 +318,9 @@ class GALE_block(nn.Module):
         Whether to use Transolver++ features. Default is ``False``.
     context_dim : int, optional
         Dimension of the context vector for cross-attention. Default is 0.
+    attention_type : str, optional
+        attention_type is used to choose the attention type (GALE or GALE_FA). 
+        Default is ``"GALE"``.
 
     Forward
     -------
@@ -410,6 +413,11 @@ class GALE_block(nn.Module):
                     n_global_queries=slice_num,
                     use_te=use_te,
                     context_dim=context_dim,
+                )
+            case _:
+                raise ValueError(
+                    f"Invalid attention type: {attention_type}. "
+                    f"Expected 'GALE' or 'GALE_FA'."
                 )
 
         # Feed-forward network with layer normalization

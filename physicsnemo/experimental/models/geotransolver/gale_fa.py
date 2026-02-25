@@ -167,9 +167,9 @@ class GALE_FA(nn.Module):
         context: Float[torch.Tensor, "batch heads context_slices context_dim"]
         | None = None,
     ) -> list[Float[torch.Tensor, "batch tokens channels"]]:
-        r"""Forward pass of the FLARE module.
+        r"""Forward pass of the GALE_FA module.
 
-        Applies FLARE attention to the input features.
+        Applies GALE_FA attention to the input features.
 
         Parameters
         ----------
