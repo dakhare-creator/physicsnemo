@@ -105,7 +105,7 @@ def test_transolver2d_forward(device, attention_type):
     file_name = (
         "models/transolver/data/transolver2d_output.pth"
         if attention_type == "physics"
-        else "models/transolver/data/transolver2d_flare_output.pth"
+        else "experimental/models/transolver/data/transolver2d_flare_output.pth"
     )
     model = Transolver(
         structured_shape=(85, 85),
@@ -149,7 +149,7 @@ def test_transolver_irregular_forward(device, attention_type):
     file_name = (
         "models/transolver/data/transolver_irregular_output.pth"
         if attention_type == "physics"
-        else "models/transolver/data/transolver_irregular_flare_output.pth"
+        else "experimental/models/transolver/data/transolver_irregular_flare_output.pth"
     )
     model = Transolver(
         structured_shape=None,
