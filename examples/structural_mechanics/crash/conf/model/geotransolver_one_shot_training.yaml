@@ -14,20 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-hydra:
-  job:
-    chdir: True
-  run:
-    dir: ./outputs/
+_target_: rollout.GeoTransolverOneShotTraining
+_convert_: all
 
-experiment_name: "Unified-Training"
-experiment_desc: "unified training recipe for crash models"
-run_desc: "unified training recipe for crash models"
+functional_dim: 3
+out_dim: 250
+geometry_dim: 3
+global_dim: 3
+slice_num: 128
+n_layers: 6
+use_te: false
+time_input: false
+include_local_features: true
 
-defaults:
-  - reader: vtp # Options are: vtp, d3plot, zarr
-  - datapipe: point_cloud   # will be overridden by model configs
-  - model: transolver_autoregressive_rollout_training
-  - training: default
-  - inference: default
-  - _self_
+### Rollout parameters ###
+num_time_steps: ${training.num_time_steps}
+dt: 5e-3

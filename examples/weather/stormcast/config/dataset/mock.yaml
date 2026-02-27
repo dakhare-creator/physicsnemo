@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-_target_: d3plot_reader.Reader
-_convert_: all
-wall_node_disp_threshold: 1.0
+name: mock.MockDataset
 
+num_state_channels: 3
+num_background_channels: 4
+image_size: [256, 128]
+num_samples: 100
