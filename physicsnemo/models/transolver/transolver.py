@@ -47,7 +47,6 @@ import physicsnemo  # noqa: F401 for docs
 from physicsnemo.core.meta import ModelMetaData
 from physicsnemo.core.module import Module
 from physicsnemo.core.version_check import check_version_spec
-from physicsnemo.experimental.models.transolver.flare import FLARE
 from physicsnemo.nn import Mlp, PositionalEmbedding
 from physicsnemo.nn.module.physics_attention import (
     PhysicsAttentionIrregularMesh,
@@ -166,9 +165,6 @@ class TransolverBlock(nn.Module):
         Whether to use transformer engine.
     plus : bool, optional, default=False
         Whether to use Transolver++ variant.
-    attention_type : str, optional
-        attention_type is used to choose the attention type (PhysicsAttention or FLARE).
-        Default is ``"PhysicsAttention"``.
 
     Forward
     -------
@@ -196,7 +192,6 @@ class TransolverBlock(nn.Module):
         spatial_shape: tuple[int, ...] | None = None,
         use_te: bool = True,
         plus: bool = False,
-        attention_type: str = "PhysicsAttention",
     ):
         super().__init__()
 
@@ -215,61 +210,43 @@ class TransolverBlock(nn.Module):
             self.ln_1 = nn.LayerNorm(hidden_dim)
 
         # Select appropriate physics attention based on spatial structure
-        match attention_type:
-            case "PhysicsAttention":
-                if spatial_shape is None:
-                    self.Attn = PhysicsAttentionIrregularMesh(
-                        hidden_dim,
-                        heads=num_heads,
-                        dim_head=hidden_dim // num_heads,
-                        dropout=dropout,
-                        slice_num=slice_num,
-                        use_te=use_te,
-                        plus=plus,
-                    )
-                else:
-                    if len(spatial_shape) == 2:
-                        self.Attn = PhysicsAttentionStructuredMesh2D(
-                            hidden_dim,
-                            spatial_shape=spatial_shape,
-                            heads=num_heads,
-                            dim_head=hidden_dim // num_heads,
-                            dropout=dropout,
-                            slice_num=slice_num,
-                            use_te=use_te,
-                            plus=plus,
-                        )
-                    elif len(spatial_shape) == 3:
-                        self.Attn = PhysicsAttentionStructuredMesh3D(
-                            hidden_dim,
-                            spatial_shape=spatial_shape,
-                            heads=num_heads,
-                            dim_head=hidden_dim // num_heads,
-                            dropout=dropout,
-                            slice_num=slice_num,
-                            use_te=use_te,
-                            plus=plus,
-                        )
-                    else:
-                        raise ValueError(
-                            f"Unexpected length of spatial shape encountered in Transolver_block: "
-                            f"{len(spatial_shape)}. Expected 2 or 3."
-                        )
-
-            case "FLARE":
-                self.Attn = FLARE(
+        if spatial_shape is None:
+            self.Attn = PhysicsAttentionIrregularMesh(
+                hidden_dim,
+                heads=num_heads,
+                dim_head=hidden_dim // num_heads,
+                dropout=dropout,
+                slice_num=slice_num,
+                use_te=use_te,
+                plus=plus,
+            )
+        else:
+            if len(spatial_shape) == 2:
+                self.Attn = PhysicsAttentionStructuredMesh2D(
                     hidden_dim,
+                    spatial_shape=spatial_shape,
                     heads=num_heads,
                     dim_head=hidden_dim // num_heads,
                     dropout=dropout,
-                    n_global_queries=slice_num,
+                    slice_num=slice_num,
                     use_te=use_te,
+                    plus=plus,
                 )
-
-            case _:
+            elif len(spatial_shape) == 3:
+                self.Attn = PhysicsAttentionStructuredMesh3D(
+                    hidden_dim,
+                    spatial_shape=spatial_shape,
+                    heads=num_heads,
+                    dim_head=hidden_dim // num_heads,
+                    dropout=dropout,
+                    slice_num=slice_num,
+                    use_te=use_te,
+                    plus=plus,
+                )
+            else:
                 raise ValueError(
-                    f"Invalid attention type: {attention_type}. "
-                    f"Expected 'PhysicsAttention' or 'FLARE'."
+                    f"Unexpected length of spatial shape encountered in Transolver_block: "
+                    f"{len(spatial_shape)}. Expected 2 or 3."
                 )
 
         # Feed-forward network with layer norm
@@ -403,9 +380,6 @@ class Transolver(Module):
         Whether to include time embeddings.
     plus : bool, optional, default=False
         Whether to use Transolver++ variant.
-    attention_type : str, optional
-        attention_type is used to choose the attention type (PhysicsAttention or FLARE).
-        Default is ``"PhysicsAttention"``.
 
     Forward
     -------
@@ -484,7 +458,6 @@ class Transolver(Module):
         use_te: bool = True,
         time_input: bool = False,
         plus: bool = False,
-        attention_type: str = "PhysicsAttention",
     ) -> None:
         super().__init__(meta=MetaData())
 
@@ -580,7 +553,6 @@ class Transolver(Module):
                     last_layer=(_ == n_layers - 1),
                     use_te=use_te,
                     plus=plus,
-                    attention_type=attention_type,
                 )
                 for _ in range(n_layers)
             ]
