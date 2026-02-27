@@ -124,7 +124,9 @@ class GALE_FA(nn.Module):
         self.use_te = use_te
         self.heads = heads
         self.dim_head = dim_head
-        self.scale = 1 if self.dim_head <= 8 else (self.dim_head ** -0.5)
+        self.scale = 1.0
+        # It is recommended by the FLARE authors to use self.scale = 1 if self.dim_head <= 8 else (self.dim_head ** -0.5)
+        # but we use self.scale = 1.0 because the recommended scaling is not tested yet.
         inner_dim = dim_head * heads
 
         linear_layer = te.Linear if self.use_te else nn.Linear

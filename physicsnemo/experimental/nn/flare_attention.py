@@ -91,7 +91,9 @@ class FLARE(nn.Module):
         self.use_te = use_te
         self.heads = heads
         self.dim_head = dim_head
-        self.scale = 1 if self.dim_head <= 8 else (self.dim_head ** -0.5)
+        self.scale = 1.0
+        # It is recommended by the FLARE authors to use self.scale = 1 if self.dim_head <= 8 else (self.dim_head ** -0.5)
+        # but we use self.scale = 1.0 because the recommended scaling is not tested yet.
         inner_dim = dim_head * heads
 
         linear_layer = te.Linear if self.use_te else nn.Linear
@@ -160,8 +162,8 @@ class FLARE(nn.Module):
             )
         else:
             # Use PyTorch's scaled dot-product attention
-            z = F.scaled_dot_product_attention(G, k, v, scale=1.0)
-            y = F.scaled_dot_product_attention(k, G, z, scale=1.0)
+            z = F.scaled_dot_product_attention(G, k, v, scale=self.scale)
+            y = F.scaled_dot_product_attention(k, G, z, scale=self.scale)
 
         out_x = y.permute(0, 2, 1, 3)  # [B, N, H, D]
         out_x = rearrange(out_x, "b n h d -> b n (h d)")
