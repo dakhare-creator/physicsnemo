@@ -36,7 +36,7 @@ from test.conftest import requires_module
 # =============================================================================
 
 
-@pytest.mark.parametrize("attention_type", ["GALE", "GAFLARE"])
+@pytest.mark.parametrize("attention_type", ["GALE", "GALE_FA"])
 @pytest.mark.parametrize("use_geometry", [False, True])
 @pytest.mark.parametrize("use_global", [False, True])
 def test_geotransolver_forward(device, attention_type, use_geometry, use_global):

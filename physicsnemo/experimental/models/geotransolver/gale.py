@@ -35,7 +35,7 @@ from physicsnemo.nn.module.physics_attention import (
     PhysicsAttentionIrregularMesh,
 )
 
-from physicsnemo.experimental.models.geotransolver.gaflare import GAFLARE
+from physicsnemo.experimental.models.geotransolver.gale_fa import GALE_FA
 
 # Check optional dependency availability
 TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False)
@@ -318,6 +318,9 @@ class GALE_block(nn.Module):
         Whether to use Transolver++ features. Default is ``False``.
     context_dim : int, optional
         Dimension of the context vector for cross-attention. Default is 0.
+    attention_type : str, optional
+        attention_type is used to choose the attention type (GALE or GALE_FA). 
+        Default is ``"GALE"``.
 
     Forward
     -------
@@ -401,8 +404,8 @@ class GALE_block(nn.Module):
                     plus=plus,
                     context_dim=context_dim,
                 )
-            case 'GAFLARE':
-                self.Attn = GAFLARE(
+            case 'GALE_FA':
+                self.Attn = GALE_FA(
                     hidden_dim,
                     heads=num_heads,
                     dim_head=hidden_dim // num_heads,
@@ -410,6 +413,11 @@ class GALE_block(nn.Module):
                     n_global_queries=slice_num,
                     use_te=use_te,
                     context_dim=context_dim,
+                )
+            case _:
+                raise ValueError(
+                    f"Invalid attention type: {attention_type}. "
+                    f"Expected 'GALE' or 'GALE_FA'."
                 )
 
         # Feed-forward network with layer normalization
