@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocks that preserve 2D and 3D rotational equivariance using a
   grid-based layout for efficient GPU parallelization, and an emphasis on
   compact `einsum` operations.
+- Flare attention support for both Transolver and GeoTransolver models.
 
 ### Changed
 

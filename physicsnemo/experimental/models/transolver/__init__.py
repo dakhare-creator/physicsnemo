@@ -14,13 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental neural network components for PhysicsNemo.
+r"""Experimental Transolver with configurable attention type.
 
-This subpackage contains experimental neural network layers and utilities
-that are under active development. These components may have breaking API
-changes between releases.
+This module provides Transolver with ``attention_type`` to select between
+physics attention and FLARE.
 """
 
-from .flare_attention import FLARE
+from .transolver import Transolver
 
-__all__ = ["FLARE"]
+__all__ = ["Transolver"]
