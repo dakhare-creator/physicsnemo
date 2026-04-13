@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from physicsnemo.core.module import Module
-from physicsnemo.experimental.models.transolver import Transolver
+from physicsnemo.experimental.models.flare import FLARE
 from test.common import (
     check_ort_version,
     validate_amp,
@@ -32,28 +32,22 @@ from test.common import (
     validate_onnx_export,
     validate_onnx_runtime,
 )
-from test.conftest import requires_module
 
 
-@pytest.mark.parametrize("attention_type", ["physics", "flare"])
 @pytest.mark.parametrize(
     "config",
     ["default_structured", "custom_irregular"],
     ids=["with_defaults_structured", "with_custom_irregular"],
 )
-def test_transolver_constructor(attention_type, config):
-    """Test Transolver model constructor and attributes per MOD-008a."""
+def test_flare_transolver_constructor(config):
+    """Test FLARE model constructor and attributes."""
     if config == "default_structured":
-        # Test with structured 2D data and default parameters
-        model = Transolver(
+        model = FLARE(
             functional_dim=3,
             out_dim=1,
             structured_shape=(64, 64),
             unified_pos=True,
-            use_te=False,
-            attention_type=attention_type,
         )
-        # Verify default attribute values
         assert model.n_hidden == 256, "Default n_hidden should be 256"
         assert model.time_input is False, "Default time_input should be False"
         assert model.unified_pos is True
@@ -61,8 +55,7 @@ def test_transolver_constructor(attention_type, config):
         assert model.embedding_dim == 64  # ref * ref = 8 * 8 = 64
         assert len(model.blocks) == 4, "Default n_layers should be 4"
     else:
-        # Test with irregular mesh data and custom parameters
-        model = Transolver(
+        model = FLARE(
             functional_dim=2,
             out_dim=4,
             embedding_dim=3,
@@ -75,12 +68,8 @@ def test_transolver_constructor(attention_type, config):
             slice_num=16,
             unified_pos=False,
             structured_shape=None,
-            use_te=False,
             time_input=True,
-            plus=True,
-            attention_type=attention_type,
         )
-        # Verify custom attribute values
         assert model.n_hidden == 64
         assert model.time_input is True
         assert model.unified_pos is False
@@ -88,26 +77,18 @@ def test_transolver_constructor(attention_type, config):
         assert model.embedding_dim == 3
         assert len(model.blocks) == 8
 
-    # Common assertions for all configurations
     assert isinstance(model, Module), (
-        "Transolver should inherit from physicsnemo.Module"
+        "FLARE should inherit from physicsnemo.Module"
     )
     assert hasattr(model, "preprocess"), "Model should have preprocess MLP"
     assert hasattr(model, "blocks"), "Model should have transformer blocks"
     assert hasattr(model, "meta"), "Model should have metadata"
 
 
-@pytest.mark.parametrize("attention_type", ["physics", "flare"])
-def test_transolver2d_forward(device, attention_type):
-    """Test Transolver2D forward pass"""
+def test_flare_transolver2d_forward(device):
+    """Test FLARE 2D forward pass"""
     torch.manual_seed(0)
-    # Construct Transolver model
-    file_name = (
-        "models/transolver/data/transolver2d_output.pth"
-        if attention_type == "physics"
-        else "experimental/models/transolver/data/transolver2d_flare_output.pth"
-    )
-    model = Transolver(
+    model = FLARE(
         structured_shape=(85, 85),
         n_layers=8,
         n_hidden=64,
@@ -121,8 +102,6 @@ def test_transolver2d_forward(device, attention_type):
         slice_num=32,
         ref=1,
         unified_pos=True,
-        use_te=False,
-        attention_type=attention_type,
     ).to(device)
 
     bsize = 4
@@ -136,22 +115,15 @@ def test_transolver2d_forward(device, attention_type):
             fx,
             embedding,
         ),
-        file_name=file_name,
+        file_name="experimental/models/flare/data/transolver2d_flare_output.pth",
         atol=2e-3,
     )
 
 
-@pytest.mark.parametrize("attention_type", ["physics", "flare"])
-def test_transolver_irregular_forward(device, attention_type):
-    """Test Transolver Irregular forward pass"""
+def test_flare_transolver_irregular_forward(device):
+    """Test FLARE irregular forward pass"""
     torch.manual_seed(0)
-    # Construct Transolver model
-    file_name = (
-        "models/transolver/data/transolver_irregular_output.pth"
-        if attention_type == "physics"
-        else "experimental/models/transolver/data/transolver_irregular_flare_output.pth"
-    )
-    model = Transolver(
+    model = FLARE(
         structured_shape=None,
         n_layers=8,
         n_hidden=64,
@@ -166,8 +138,6 @@ def test_transolver_irregular_forward(device, attention_type):
         slice_num=32,
         ref=1,
         unified_pos=False,
-        use_te=False,
-        attention_type=attention_type,
     ).to(device)
 
     bsize = 4
@@ -181,19 +151,18 @@ def test_transolver_irregular_forward(device, attention_type):
             embedding,
             functional_input,
         ),
-        file_name=file_name,
+        file_name="experimental/models/flare/data/transolver_irregular_flare_output.pth",
         atol=1e-3,
     )
 
 
-@pytest.mark.parametrize("attention_type", ["physics", "flare"])
-def test_transolver_optims(device, attention_type):
-    """Test transolver optimizations"""
+def test_flare_transolver_optims(device):
+    """Test FLARE optimizations"""
 
     def setup_model():
-        """Setups up fresh transolver model and inputs for each optim test"""
+        """Set up fresh FLARE model and inputs for each optim test"""
 
-        model = Transolver(
+        model = FLARE(
             structured_shape=None,
             n_layers=8,
             n_hidden=64,
@@ -208,8 +177,6 @@ def test_transolver_optims(device, attention_type):
             slice_num=32,
             ref=1,
             unified_pos=False,
-            use_te=False,
-            attention_type=attention_type,
         ).to(device)
 
         if device == "cuda:0":
@@ -263,15 +230,9 @@ def test_transolver_optims(device, attention_type):
     )
 
 
-@requires_module("transformer_engine")
-@pytest.mark.parametrize("attention_type", ["physics"])
-def test_transolver_te(pytestconfig, attention_type):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is not available")
-
-    torch.manual_seed(0)
-
-    model = Transolver(
+def test_flare_transolver_checkpoint(device):
+    """Test FLARE checkpoint save/load"""
+    model_1 = FLARE(
         structured_shape=None,
         n_layers=8,
         n_hidden=64,
@@ -286,50 +247,9 @@ def test_transolver_te(pytestconfig, attention_type):
         slice_num=32,
         ref=1,
         unified_pos=False,
-        use_te=True,
-        attention_type=attention_type,
-    ).to("cuda")
-
-    bsize = 4
-
-    embedding = torch.randn(bsize, 12345, 3).to("cuda")
-    functional_input = torch.randn(bsize, 12345, 2).to("cuda")
-
-    assert validate_forward_accuracy(
-        model,
-        (
-            embedding,
-            functional_input,
-        ),
-        file_name="models/transolver/data/transolver_irregular_te_output.pth",
-        atol=1e-3,
-    )
-
-
-@pytest.mark.parametrize("attention_type", ["physics", "flare"])
-def test_transolver_checkpoint(device, attention_type):
-    """Test transolver checkpoint save/load"""
-    # Construct transolver models
-    model_1 = Transolver(
-        structured_shape=None,
-        n_layers=8,
-        n_hidden=64,
-        dropout=0,
-        n_head=4,
-        time_input=False,
-        act="gelu",
-        mlp_ratio=1,
-        functional_dim=2,
-        embedding_dim=3,
-        out_dim=1,
-        slice_num=32,
-        ref=1,
-        unified_pos=False,
-        use_te=False,
-        attention_type=attention_type,
     ).to(device)
 
-    model_2 = Transolver(
+    model_2 = FLARE(
         structured_shape=None,
         n_layers=8,
         n_hidden=64,
@@ -344,8 +264,6 @@ def test_transolver_checkpoint(device, attention_type):
         slice_num=32,
         ref=1,
         unified_pos=False,
-        use_te=False,
-        attention_type=attention_type,
     ).to(device)
 
     bsize = random.randint(1, 2)
@@ -364,11 +282,9 @@ def test_transolver_checkpoint(device, attention_type):
 
 
 @check_ort_version()
-@pytest.mark.parametrize("attention_type", ["physics", "flare"])
-def test_transolver_deploy(device, attention_type):
-    """Test transolver deployment support"""
-    # Construct transolver model
-    model = Transolver(
+def test_flare_transolver_deploy(device):
+    """Test FLARE deployment support"""
+    model = FLARE(
         structured_shape=(85, 85),
         n_layers=8,
         n_hidden=64,
@@ -382,8 +298,6 @@ def test_transolver_deploy(device, attention_type):
         slice_num=32,
         ref=1,
         unified_pos=True,
-        use_te=False,
-        attention_type=attention_type,
     ).to(device)
 
     bsize = 4

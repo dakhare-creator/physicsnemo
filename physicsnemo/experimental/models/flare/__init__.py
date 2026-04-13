@@ -14,12 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Experimental Transolver with configurable attention type.
+r"""FLARE Transolver: Transolver with FLARE attention.
 
-This module provides Transolver with ``attention_type`` to select between
-physics attention and FLARE.
+This module provides FLARE, a Transolver variant that uses
+FLARE (Fast Low-rank Attention Routing Engine) attention.
 """
 
-from .transolver import Transolver
+from .transolver import FLARE
 
-__all__ = ["Transolver"]
+__all__ = ["FLARE"]

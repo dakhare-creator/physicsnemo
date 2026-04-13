@@ -15,10 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Experimental Transolver with configurable attention type.
+r"""FLARE Transolver: Transolver with FLARE attention.
 
-Experimental Transolver that inherits from core Transolver and supports
-multiple attention backends via ``attention_type``: physics attention or FLARE.
+Transolver variant that uses FLARE (Fast Low-rank Attention Routing Engine)
+attention instead of physics attention. Inherits from the core Transolver
+and replaces all attention blocks with FLARE blocks.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from jaxtyping import Float
 from physicsnemo.models.transolver import Transolver as CoreTransolver
 from physicsnemo.models.transolver.transolver import _TransolverMlp
 
-from physicsnemo.experimental.nn import FLARE
+from physicsnemo.experimental.nn import FLARE as FLAREAttention
 
 
 class _FLAREBlock(nn.Module):
@@ -56,7 +57,7 @@ class _FLAREBlock(nn.Module):
         dim_head = hidden_dim // num_heads
 
         self.ln_1 = nn.LayerNorm(hidden_dim)
-        self.Attn = FLARE(
+        self.Attn = FLAREAttention(
             dim=hidden_dim,
             heads=num_heads,
             dim_head=dim_head,
@@ -90,13 +91,12 @@ class _FLAREBlock(nn.Module):
         return fx
 
 
-class Transolver(CoreTransolver):
-    r"""Experimental Transolver with configurable attention type.
+class FLARE(CoreTransolver):
+    r"""Transolver with FLARE attention.
 
-    Inherits from the core Transolver and adds ``attention_type`` to select
-    between physics attention (default) and FLARE attention. When
-    ``attention_type="flare"``, FLARE is used and Transformer Engine is
-    disabled (use_te forced to False).
+    Inherits from the core Transolver and replaces all physics attention blocks
+    with FLARE (Fast Low-rank Attention Routing Engine) blocks. Transformer
+    Engine is not supported (use_te is forced to False).
 
     Parameters
     ----------
@@ -119,23 +119,15 @@ class Transolver(CoreTransolver):
     mlp_ratio : int, optional
         MLP hidden ratio. Default is 4.
     slice_num : int, optional
-        Number of physics slices (physics) or global queries (flare).
-        Default is 32.
+        Number of global queries for FLARE attention. Default is 32.
     unified_pos : bool, optional
         Whether to use unified positional embeddings. Default is ``False``.
     ref : int, optional
         Reference grid size for unified position. Default is 8.
     structured_shape : None | tuple[int, ...], optional
         Shape of structured data. ``None`` for unstructured. Default is ``None``.
-    use_te : bool, optional
-        Whether to use Transformer Engine. Ignored when ``attention_type="flare"``.
-        Default is ``True``.
     time_input : bool, optional
         Whether to include time embeddings. Default is ``False``.
-    plus : bool, optional
-        Whether to use Transolver++ variant (physics only). Default is ``False``.
-    attention_type : str, optional
-        Attention backend: ``"physics"`` (default) or ``"flare"``.
 
     Forward
     -------
@@ -148,7 +140,7 @@ class Transolver(CoreTransolver):
     See Also
     --------
     :class:`~physicsnemo.models.transolver.Transolver` : Core Transolver model.
-    :class:`~physicsnemo.experimental.nn.FLARE` : FLARE attention layer.
+    :class:`~physicsnemo.experimental.nn.flare_attention.FLARE` : FLARE attention layer.
     """
 
     def __init__(
@@ -166,30 +158,8 @@ class Transolver(CoreTransolver):
         unified_pos: bool = False,
         ref: int = 8,
         structured_shape: None | tuple[int, ...] = None,
-        use_te: bool = True,
         time_input: bool = False,
-        plus: bool = False,
-        attention_type: str = "physics",
     ) -> None:
-        if attention_type not in ("physics", "flare"):
-            raise ValueError(
-                f"attention_type must be 'physics' or 'flare', got {attention_type!r}"
-            )
-
-        # FLARE does not support TE
-        effective_use_te = use_te if attention_type == "physics" else False
-        if attention_type == "flare" and use_te:
-            import warnings
-
-            from physicsnemo.core.warnings import ExperimentalFeatureWarning
-
-            warnings.warn(
-                "attention_type='flare' requires use_te=False; Transformer Engine "
-                "is incompatible with FLARE. Forcing use_te=False.",
-                ExperimentalFeatureWarning,
-                stacklevel=2,
-            )
-
         super().__init__(
             functional_dim=functional_dim,
             out_dim=out_dim,
@@ -204,28 +174,25 @@ class Transolver(CoreTransolver):
             unified_pos=unified_pos,
             ref=ref,
             structured_shape=structured_shape,
-            use_te=effective_use_te,
+            use_te=False,
             time_input=time_input,
-            plus=plus,
+            plus=False,
         )
 
-        self.attention_type = attention_type
-
-        if attention_type == "flare":
-            # Replace physics attention blocks with FLARE blocks
-            self.blocks = nn.ModuleList(
-                [
-                    _FLAREBlock(
-                        num_heads=n_head,
-                        hidden_dim=n_hidden,
-                        dropout=dropout,
-                        act=act,
-                        mlp_ratio=mlp_ratio,
-                        last_layer=(i == n_layers - 1),
-                        out_dim=out_dim,
-                        n_global_queries=slice_num,
-                    )
-                    for i in range(n_layers)
-                ]
-            )
-            self.initialize_weights()
+        # Replace physics attention blocks with FLARE blocks
+        self.blocks = nn.ModuleList(
+            [
+                _FLAREBlock(
+                    num_heads=n_head,
+                    hidden_dim=n_hidden,
+                    dropout=dropout,
+                    act=act,
+                    mlp_ratio=mlp_ratio,
+                    last_layer=(i == n_layers - 1),
+                    out_dim=out_dim,
+                    n_global_queries=slice_num,
+                )
+                for i in range(n_layers)
+            ]
+        )
+        self.initialize_weights()
