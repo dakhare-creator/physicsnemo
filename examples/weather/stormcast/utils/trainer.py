@@ -16,7 +16,6 @@
 
 """Trainer class for StormCast/StormScope training."""
 
-from collections.abc import Callable, Sequence
 import os
 import time
 
@@ -27,15 +26,21 @@ from torch.nn.utils import clip_grad_norm_
 import psutil
 from physicsnemo.core import Module
 from physicsnemo.distributed import DistributedManager
-from physicsnemo.utils import load_checkpoint, save_checkpoint
+from physicsnemo.utils import load_checkpoint, load_model_weights, save_checkpoint
 
-from utils.loss import EDMLoss, EDMLossLogUniform
+from physicsnemo.diffusion.metrics.losses import WeightedMSEDSMLoss
+from physicsnemo.diffusion.noise_schedulers import EDMNoiseScheduler, NoiseScheduler
+
+from utils.loss import (
+    RegressionLoss,
+    SigmaBinTracker,
+    build_noise_scheduler,
+)
 
 from utils.config import MainConfig
 from utils.logging import ExperimentLogger
 from utils.nn import (
     diffusion_model_forward,
-    regression_loss_fn,
     get_preconditioned_natten_dit,
     get_preconditioned_unet,
     build_network_condition_and_target,
@@ -78,6 +83,11 @@ class Trainer:
         Current training step count.
     val_loss : float
         Latest validation loss.
+    train_noise_scheduler : NoiseScheduler or None
+        For diffusion training, the noise scheduler used for training-time
+        sigma sampling (same object as held by the loss). Set before applying
+        ``torch.compile`` to the loss so callers always access the real
+        scheduler. ``None`` for regression runs.
 
     Examples
     --------
@@ -119,38 +129,22 @@ class Trainer:
         # Initialize components
         self._setup_data()
 
-        # Placeholder model+optimizer for checkpoint loading/saving (rank 0 only, kept on CPU)
-        if self.dist.rank == 0:
-            self.net_full = self._setup_model()
-            (self.optimizer_full, self.scheduler_full) = self._setup_optimizer(
-                self.net_full
-            )
-            (self.total_steps, self.val_loss) = self._resume_or_init(
-                self.net_full, self.optimizer_full, self.scheduler_full
-            )
-        else:
-            self.net_full = self.optimizer_full = self.scheduler_full = None
+        # All ranks use the same seed so parameter initialization is identical.
+        # FSDP sync_module_states and distribute_tensor also broadcast from
+        # rank 0, but explicit seeding avoids silent dependence on those.
+        torch.manual_seed(self.cfg.training.seed)
 
-        (self.total_steps, self.val_loss) = self.parallel_helper.scatter_object(
-            (self.total_steps, self.val_loss) if self.dist.rank == 0 else None
-        )
-
-        # Actual models
+        # Create model and move to device
         self.net = self._setup_model()
         self.logger.info(str(self.net))
-        self.net.load_state_dict(  # TODO: avoid replicating full state_dict on every rank
-            self.parallel_helper.scatter_object(
-                self.net_full.state_dict() if self.dist.rank == 0 else {}
-            )
-        )
         self.net.train().requires_grad_(True).to(
             device=self.device, memory_format=self.memory_format
         )
+
         # Load regression net if needed
         self.regression_net = self._load_regression_net()
 
-        # Sharding
-
+        # Sharding and FSDP wrapping
         if self.use_shard_tensor:
             self.logger.info(
                 "Distributing model with FSDP and sharding for domain parallelism"
@@ -166,30 +160,33 @@ class Trainer:
             self.invariant_tensor = self.parallel_helper.distribute_tensor(
                 self.invariant_tensor
             )
-        # Create optimizer on sharded net
-        (self.optimizer, self.scheduler) = self._setup_optimizer(
-            self.net
-        )  # for sharded net
-        if self.total_steps > 0:
-            self.parallel_helper.scatter_optimizer_state(
-                self.net_full,
-                self.optimizer_full,
-                self.scheduler_full,
-                self.net,
-                self.optimizer,
-                self.scheduler,
-            )
 
-        # Loss function
+        # Create optimizer on the distributed model
+        (self.optimizer, self.scheduler) = self._setup_optimizer(self.net)
+
+        # Resume from checkpoint (all ranks participate)
+        (self.total_steps, self.val_loss) = self._resume_or_init()
+
+        # Loss function (``train_noise_scheduler`` is set inside for diffusion)
+        self.train_noise_scheduler: NoiseScheduler | None = None
         self.loss_fn = self._setup_loss()
+        self.sigma_bin_tracker = SigmaBinTracker(
+            self.cfg.training.loss, self.device, self.loss_type
+        )
+        if self.sigma_bin_tracker.enabled:
+            self.logger.info(
+                f"Sigma-bin tracking enabled with edges: {self.sigma_bin_tracker.edges}"
+            )
 
         # Training state
         self.train_steps = 0
         self.avg_train_loss = 0.0
         self.valid_time = -1.0
 
-        # This seems to be needed to avoid unwanted RNG synchronization by torch
-        torch.manual_seed(0)
+        # Put RNG in a deterministic per-rank state for any operations
+        # between __init__ and the first train_step.  train_step will call
+        # _setup_seeds again with the current step before doing real work.
+        self._setup_seeds(self.total_steps)
 
     # =========================================================================
     # Configuration
@@ -281,21 +278,31 @@ class Trainer:
 
     def _setup_seeds(self, step: int = 0):
         r"""
-        Configure random seeds and CUDA backends.
+        Set deterministic per-rank, per-step RNG seeds.
+
+        Called at the start of each training step so that randomness (diffusion
+        sigma sampling, noise generation) is reproducible.  Each
+        ``(step, rank)`` pair maps to a unique seed:
+
+        * Different ranks produce different random sequences, as required by
+          data-parallel training where each rank processes different data.
+        * The same ``(seed, step, rank)`` triple always reproduces the same
+          sequence across identical runs.
+        * Within a model-parallel (domain) group, diffusion sigma values
+          are kept consistent via broadcast (handled by the
+          :class:`~physicsnemo.diffusion.DomainParallelNoiseScheduler`
+          that wraps the noise scheduler), not by sharing a seed, so that
+          spatial noise generated by ``torch.randn_like`` remains
+          independent per shard.
 
         Parameters
         ----------
         step : int, optional
-            Current training step for seed offset calculation, by default 0.
+            Current training step, by default 0.
         """
-        # torch.manual_seed(self.dist.rank)
-        # return
-        seed_offset = (
-            self.cfg.training.seed * self.dist.world_size * max(step, 1)
-            + self.dist.rank
-        )
-        np.random.seed(seed_offset % (1 << 31))
-        torch.manual_seed(seed_offset % (1 << 31))
+        seed = self.cfg.training.seed + step * self.dist.world_size + self.dist.rank
+        np.random.seed(seed % (1 << 31))
+        torch.manual_seed(seed)
 
     # =========================================================================
     # Data Setup
@@ -327,6 +334,7 @@ class Trainer:
             self.dataset_train,
             batch_size=self.local_batch_size,
             num_workers=num_workers,
+            seed=self.cfg.training.seed,
         )
         self.dataset_iterator = self.parallel_helper.sharded_data_iter(
             self.train_dataloader
@@ -343,6 +351,20 @@ class Trainer:
             )
         else:
             self.invariant_tensor = None
+            if (
+                "invariant" in self.cfg.model.diffusion_conditions
+                or "invariant" in self.cfg.model.regression_conditions
+            ):
+                self.logger.info(
+                    "Invariant conditions specified in model configuration, but dataset provides no invariants. Ignoring invariant conditions."
+                )
+
+        if (
+            self.cfg.model.architecture != "dit"
+        ) and self.dataset_train.scalar_condition_channels():
+            raise ValueError(
+                "Scalar conditions are only supported for the 'dit' architecture."
+            )
 
     # =========================================================================
     # Model Setup
@@ -387,10 +409,9 @@ class Trainer:
                 img_resolution=self.dataset_train.image_shape(),
                 target_channels=len(self.state_channels),
                 conditional_channels=num_condition_channels,
-                spatial_embedding=model_cfg.spatial_pos_embed,
-                attn_resolutions=model_cfg.attn_resolutions,
                 lead_time_steps=self.lead_time_steps,
                 amp_mode=self.enable_amp,
+                use_apex_gn=self.use_apex_gn,
                 **model_cfg.hyperparameters,
             )
         elif model_cfg.architecture == "dit":
@@ -440,52 +461,75 @@ class Trainer:
     # Loss and Optimizer Setup
     # =========================================================================
 
-    def _setup_loss(self) -> EDMLoss | Callable[..., torch.Tensor]:
+    def _setup_loss(self) -> WeightedMSEDSMLoss | RegressionLoss:
         r"""
         Create the loss function.
 
-        For regression models, uses MSE loss. For diffusion models, creates EDM loss
-        with configurable sigma distribution (lognormal or loguniform).
-        Optionally compiles the loss function with torch.compile.
+        For regression models, uses :class:`~utils.loss.RegressionLoss`.
+        For diffusion models, creates a
+        :class:`~physicsnemo.diffusion.metrics.losses.WeightedMSEDSMLoss`
+        with an
+        :class:`~physicsnemo.diffusion.noise_schedulers.EDMNoiseScheduler`.
+        When domain parallelism is active the scheduler is wrapped via
+        :meth:`~utils.parallel.ParallelHelper.make_domain_parallel_scheduler`
+        so that sampled sigmas are broadcast across spatial shards.
+
+        A separate sampling scheduler is also created for validation-time
+        diffusion sampling.
+
+        When ``training.perf.torch_compile`` is enabled (and domain parallelism
+        is off), the loss callable is wrapped with :func:`torch.compile` so the
+        forward path through the preconditioned model and loss is compiled.
 
         Returns
         -------
-        EDMLoss | Callable[..., torch.Tensor]
-            The loss function.
+        WeightedMSEDSMLoss | RegressionLoss
+            The loss function (possibly ``torch.compile``-wrapped).
         """
         self.logger.info("Setting up loss function...")
 
+        self.sampling_scheduler = None
+
+        compile_loss = self.use_torch_compile and not self.use_shard_tensor
+        if self.use_torch_compile and self.use_shard_tensor:
+            self.logger.info(
+                "Skipping torch.compile on loss: not supported with "
+                "domain parallelism / ShardTensor."
+            )
+
         if self.loss_type == "regression":
-            loss_fn = regression_loss_fn
-            if self.use_torch_compile:
+            loss_fn = RegressionLoss(self.net)
+            if compile_loss:
                 self.logger.info("Compiling loss function with torch.compile...")
                 loss_fn = torch.compile(loss_fn)
             return loss_fn
 
-        # EDM loss
         loss_params = self.cfg.training.loss
-        sigma_data = loss_params.sigma_data
-        if isinstance(sigma_data, Sequence):
-            sigma_data = torch.as_tensor(
-                list(sigma_data), dtype=torch.float32, device=self.device
-            )[None, :, None, None]
+        self.logger.info(
+            f"Using modern diffusion loss: {loss_params.sigma_distribution}"
+        )
 
-        sigma_dist = loss_params.sigma_distribution
-        if sigma_dist == "lognormal":
-            loss_cls, param_names = EDMLoss, ("P_mean", "P_std")
-        elif sigma_dist == "loguniform":
-            loss_cls, param_names = EDMLossLogUniform, ("sigma_min", "sigma_max")
-        else:
-            raise ValueError(
-                "training.loss.sigma_distribution must be 'lognormal' or 'loguniform'"
-            )
+        noise_scheduler = build_noise_scheduler(
+            loss_params,
+            self.logger,
+        )
+        noise_scheduler = self.parallel_helper.make_domain_parallel_scheduler(
+            noise_scheduler,
+        )
+        loss_fn = WeightedMSEDSMLoss(self.net, noise_scheduler, reduction="none")
+        self.train_noise_scheduler = loss_fn.noise_scheduler
 
-        params = {k: getattr(loss_params, k) for k in param_names}
-        params["sigma_source_rank"] = self.parallel_helper.get_domain_group_zero_rank()
-        self.logger.info(f"Using loss: {sigma_dist}, params: {params or 'default'}")
-        loss_fn = loss_cls(sigma_data=sigma_data, **params)
+        sa = self.cfg.sampler.args.__dict__
+        sampling_scheduler = EDMNoiseScheduler(
+            sigma_min=sa.get("sigma_min", 0.002),
+            sigma_max=sa.get("sigma_max", 80.0),
+            rho=sa.get("rho", 7.0),
+        )
+        self.sampling_scheduler = self.parallel_helper.make_domain_parallel_scheduler(
+            sampling_scheduler
+        )
 
-        if self.use_torch_compile:
+        if compile_loss:
             self.logger.info("Compiling loss function with torch.compile...")
             loss_fn = torch.compile(loss_fn)
 
@@ -497,7 +541,7 @@ class Trainer:
         r"""
         Create optimizer and scheduler.
 
-        Builds optimizer using configuration (Adam, AdamW, or StableAdamW).
+        Builds optimizer using configuration (Adam or AdamW).
         Optionally initializes a learning rate scheduler for decay after warmup.
 
         Parameters
@@ -525,31 +569,15 @@ class Trainer:
         if scheduler:
             self.logger.info(f"Using scheduler: {scheduler_name}")
 
-        self.augment_pipe = None
-
         return (optimizer, scheduler)
 
-    def _resume_or_init(
-        self,
-        net: Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler.LRScheduler | None,
-    ) -> tuple[int, float]:
+    def _resume_or_init(self) -> tuple[int, float]:
         r"""
         Resume from checkpoint or initialize training.
 
-        Attempts to load model, optimizer, and scheduler state from checkpoint.
-        If no checkpoint exists, optionally loads initial weights from a separate file.
-        Re-seeds RNG for reproducibility after checkpoint load.
-
-        Parameters
-        ----------
-        net : physicsnemo.core.Module
-            The module to load the checkpoint into.
-        optimizer : torch.optim.Optimizer
-            The optimizer to load the optimizer state into.
-        scheduler : torch.optim.Optimizer | None
-            The scheduler to load the scheduler state into, or None if no scheduler if used.
+        All ranks participate.  The distributed checkpoint utilities handle
+        gathering (save) and scattering (load) of FSDP / ShardTensor state
+        automatically.
 
         Returns
         -------
@@ -562,30 +590,28 @@ class Trainer:
         """
         self.logger.info(f'Trying to resume from "{self.ckpt_path}"...')
 
-        # Load checkpoint with metadata
-        metadata_dict = {}
+        metadata_dict: dict = {}
         total_steps = load_checkpoint(
             path=self.ckpt_path,
-            models=net,
-            optimizer=optimizer,
-            scheduler=scheduler,
+            models=self.net,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
             epoch=None
             if self.cfg.training.resume_checkpoint == "latest"
             else self.cfg.training.resume_checkpoint,
             metadata_dict=metadata_dict,
         )
 
-        # Load validation loss from metadata
         val_loss = metadata_dict.get("val_loss", -1.0)
 
         if total_steps == 0:
             self.logger.info("No resumable state found.")
             init_weights = self.cfg.training.initial_weights
-            if init_weights is None:
-                self.logger.info("Starting training from scratch...")
-            else:
+            if init_weights is not None:
                 self.logger.info(f"Loading initial weights from {init_weights}...")
-                net.load(init_weights)
+                load_model_weights(self.net, init_weights)
+            else:
+                self.logger.info("Starting training from scratch...")
 
         return (total_steps, val_loss)
 
@@ -610,6 +636,7 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss = None
         channelwise_loss = torch.zeros((), device=self.device, requires_grad=False)
+        self.sigma_bin_tracker.reset()
 
         for _ in range(self.num_accumulation_rounds):
             batch = next(self.dataset_iterator)
@@ -629,20 +656,29 @@ class Trainer:
                     regression_condition_list=self.cfg.model.regression_conditions,
                 )
                 del background, state, scalar_conditions
-                # Only pass lead_time_label if the model supports it
+
+                weight = (
+                    mask
+                    if mask is not None
+                    else torch.ones((), device=target.device, dtype=target.dtype)
+                )
                 loss_kwargs = {}
                 if lead_time_label is not None:
                     loss_kwargs["lead_time_label"] = lead_time_label
-                loss = self.loss_fn(
-                    net=self.net,
-                    images=target,
-                    condition=condition,
-                    augment_pipe=self.augment_pipe,
-                    **loss_kwargs,
-                )
 
-                if mask is not None:
-                    loss = loss * mask
+                sigma = None
+                if self.loss_type != "regression":
+                    assert self.train_noise_scheduler is not None
+                    sigma = self.train_noise_scheduler.sample_time(
+                        target.shape[0],
+                        device=target.device,
+                        dtype=target.dtype,
+                    )
+                    loss_kwargs["t"] = sigma
+
+                loss = self.loss_fn(target, weight, condition=condition, **loss_kwargs)
+
+                self.sigma_bin_tracker.update(loss, sigma)
 
             channelwise_loss_step = loss.detach().mean(dim=(0, 2, 3))
             if self.use_shard_tensor:
@@ -656,6 +692,8 @@ class Trainer:
             self.logger.log_value(
                 f"loss/train/{ch}", value / self.num_accumulation_rounds
             )
+
+        self.sigma_bin_tracker.log(self.logger, world_size=self.dist.world_size)
 
         # Gradient clipping
         if self.cfg.training.clip_grad_norm > 0:
@@ -719,9 +757,11 @@ class Trainer:
         plot_background : torch.Tensor or None
             Background conditioning from first batch.
         """
-        # Set seed for reproducible validation
-        np.random.seed(self.dist.rank)
-        torch.manual_seed(self.dist.rank)
+        # Fixed validation seed tied to config so results are reproducible across
+        # runs.  Uses a large offset to avoid overlap with training-step seeds.
+        val_seed = self.cfg.training.seed + (1 << 30) + self.dist.rank
+        np.random.seed(val_seed % (1 << 31))
+        torch.manual_seed(val_seed)
 
         valid_dataloader = self.parallel_helper.sharded_dataloader(
             self.dataset_valid,
@@ -756,44 +796,26 @@ class Trainer:
                         regression_condition_list=self.cfg.model.regression_conditions,
                     )
 
-                    loss_kwargs = (
-                        {"return_model_outputs": True}
-                        if self.net_name == "regression"
-                        else {}
+                    weight = (
+                        mask
+                        if mask is not None
+                        else torch.ones((), device=target.device, dtype=target.dtype)
                     )
-                    # Only pass lead_time_label if the model supports it
+                    loss_kwargs = {}
                     if lead_time_label is not None:
                         loss_kwargs["lead_time_label"] = lead_time_label
 
                     valid_loss = self.loss_fn(
-                        net=self.net,
-                        images=target,
-                        condition=condition,
-                        augment_pipe=self.augment_pipe,
-                        **loss_kwargs,
+                        target, weight, condition=condition, **loss_kwargs
                     )
 
-                    # Apply mask
-                    if mask is not None:
-                        if isinstance(valid_loss, tuple):
-                            valid_loss = (valid_loss[0] * mask, valid_loss[1])
-                        else:
-                            valid_loss = valid_loss * mask
-
-                    # Save first batch for plotting
                     if v_i == 0:
                         plot_state, plot_background = state, background
                         plot_outputs = self._get_plot_outputs(
-                            valid_loss, condition, state, lead_time_label, reg_out
+                            condition, state, lead_time_label, reg_out
                         )
-                    elif self.loss_type == "regression":
-                        valid_loss, _ = valid_loss
 
-                    valid_loss_mean_step = (
-                        valid_loss.mean(dim=(0, 2, 3))
-                        if not isinstance(valid_loss, tuple)
-                        else valid_loss[0].mean(dim=(0, 2, 3))
-                    )
+                    valid_loss_mean_step = valid_loss.mean(dim=(0, 2, 3))
                     if self.use_shard_tensor:
                         valid_loss_mean_step = valid_loss_mean_step.to_local()
                     valid_loss_sum = valid_loss_sum + valid_loss_mean_step
@@ -817,14 +839,15 @@ class Trainer:
 
         return val_loss, plot_outputs, plot_state, plot_background
 
-    def _get_plot_outputs(self, valid_loss, condition, state, lead_time_label, reg_out):
+    def _get_plot_outputs(self, condition, state, lead_time_label, reg_out):
         r"""
         Get outputs for validation plotting.
 
+        For diffusion models, runs full reverse-ODE sampling.  For regression
+        models, runs a forward pass to obtain the prediction.
+
         Parameters
         ----------
-        valid_loss : torch.Tensor or tuple
-            Validation loss, or tuple of (loss, outputs) for regression.
         condition : torch.Tensor
             Conditioning tensor for the model.
         state : tuple
@@ -843,17 +866,21 @@ class Trainer:
             outputs = diffusion_model_forward(
                 self.net,
                 condition,
-                state[1].shape,
-                sampler_args=self.cfg.sampler.args.__dict__.copy(),
+                shape=state[1].shape,
+                scheduler=self.sampling_scheduler,
+                dtype=state[1].dtype,
+                device=state[1].device,
+                sampler_args=self.cfg.sampler.args.__dict__,
                 lead_time_label=lead_time_label,
             )
             if "regression" in self.condition_list:
                 outputs += reg_out
             return outputs
         else:
-            # Regression model - valid_loss is (loss_tensor, output_images)
-            _, output_images = valid_loss
-            return output_images
+            labels = (
+                {} if lead_time_label is None else {"lead_time_label": lead_time_label}
+            )
+            return self.net(x=condition, **labels)
 
     # =========================================================================
     # Logging
@@ -897,27 +924,17 @@ class Trainer:
         r"""
         Save training checkpoint with metadata.
 
-        Saves model weights, optimizer state, scheduler state, and validation loss
-        to the checkpoint directory. Only rank 0 saves to avoid file conflicts.
+        All ranks participate; the checkpoint utilities handle gathering
+        FSDP / ShardTensor state automatically and only rank 0 writes files.
         """
-        self.parallel_helper.gather_training_state(
-            self.net,
-            self.optimizer,
-            self.scheduler,
-            self.net_full,
-            self.optimizer_full,
-            self.scheduler_full,
+        save_checkpoint(
+            path=self.ckpt_path,
+            models=self.net,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            epoch=self.total_steps,
+            metadata={"val_loss": self.val_loss},
         )
-
-        if self.dist.rank == 0:
-            save_checkpoint(
-                path=self.ckpt_path,
-                models=self.net_full,
-                optimizer=self.optimizer_full,
-                scheduler=self.scheduler_full,
-                epoch=self.total_steps,
-                metadata={"val_loss": self.val_loss},
-            )
 
     # =========================================================================
     # Main Training Loop

@@ -14,22 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Literal
 
-import numpy as np
 from tensordict import TensorDict
 import torch
 
+import importlib
+
 from physicsnemo.core import Module
 from physicsnemo.models.diffusion_unets import StormCastUNet
-from physicsnemo.diffusion.preconditioners import EDMPrecond, EDMPreconditioner
+from physicsnemo.diffusion.preconditioners import EDMPreconditioner
+from physicsnemo.diffusion.samplers import sample as diffusion_sample
 from physicsnemo.diffusion.utils import ConcatConditionWrapper
-
-# from physicsnemo.diffusion.samplers import deterministic_sampler
 from physicsnemo.models.dit import DiT
+from physicsnemo.diffusion.noise_schedulers import NoiseScheduler
 
-from utils.sampler import deterministic_sampler
 import utils.apex  # do not remove, enables Apex LayerNorm with ShardTensor
 
 
@@ -37,16 +37,14 @@ def get_preconditioned_unet(
     name: str,
     target_channels: int,
     conditional_channels: int = 0,
-    spatial_embedding: bool = True,
     img_resolution: tuple = (512, 640),
     model_type: str | None = None,
-    channel_mult: list = [1, 2, 2, 2, 2],
-    attn_resolutions: list = [],
     lead_time_steps: int = 0,
     lead_time_channels: int = 4,
     amp_mode: bool = False,
+    use_apex_gn: bool = False,
     **model_kwargs,
-) -> EDMPrecond | StormCastUNet:
+) -> EDMPreconditioner | StormCastUNet:
     """
     Create a preconditioner-wrapped SongUNet network.
 
@@ -54,15 +52,14 @@ def get_preconditioned_unet(
         name: 'regression' or 'diffusion' to select between either model type
         target_channels: The number of channels in the target
         conditional_channels: The number of channels in the conditioning
-        spatial_embedding: whether or not to use the additive spatial embedding in the U-Net
         img_resolution: resolution of the data (U-Net inputs/outputs)
         model_type: the model class to use, or None to select it automatically
-        channel_mult: the channel multipliers for the different levels of the U-Net
-        attn_resolutions: resolution of internal U-Net stages to use self-attention
         lead_time_steps: the number of possible lead time steps, if 0 lead time embedding will be disabled
         lead_time_channels: the number of channels to use for each lead time embedding
+        amp_mode: whether to use automatic mixed precision
+        use_apex_gn: whether to use Apex GroupNorm
     Returns:
-        EDMPrecond or StormCastUNet: a wrapped torch module net(x+n, sigma, condition, class_labels) -> x
+        EDMPreconditioner or StormCastUNet: a wrapped torch module net(x+n, sigma, condition) -> x
     """
 
     if model_type is None:
@@ -72,10 +69,8 @@ def get_preconditioned_unet(
         "img_resolution": img_resolution,
         "img_out_channels": target_channels,
         "model_type": model_type,
-        "channel_mult": channel_mult,
-        "attn_resolutions": attn_resolutions,
-        "additive_pos_embed": spatial_embedding,
         "amp_mode": amp_mode,
+        "use_apex_gn": use_apex_gn,
     }
     model_params.update(model_kwargs)
 
@@ -87,10 +82,15 @@ def get_preconditioned_unet(
         lead_time_channels = 0
 
     if name == "diffusion":
-        return EDMPrecond(
-            img_channels=target_channels + conditional_channels + lead_time_channels,
+        unet_module = importlib.import_module("physicsnemo.models.diffusion_unets")
+        model_class = getattr(unet_module, model_params.pop("model_type"))
+        out_channels = model_params.pop("img_out_channels")
+        unet = model_class(
+            in_channels=target_channels + conditional_channels + lead_time_channels,
+            out_channels=out_channels,
             **model_params,
         )
+        return EDMPreconditioner(model=ConcatConditionWrapper(unet))
 
     elif name == "regression":
         return StormCastUNet(
@@ -111,7 +111,7 @@ def get_preconditioned_natten_dit(
     patch_size: int = 4,
     attn_kernel_size: int = 31,
     lead_time_steps: int = 0,
-    layernorm_backend: Literal["torch", "apex"] = "apex",
+    layernorm_backend: Literal["torch", "apex"] = "torch",
     conditioning_embedder: Literal["dit", "edm", "zero"] = "dit",
     **model_kwargs,
 ) -> EDMPreconditioner:
@@ -131,7 +131,7 @@ def get_preconditioned_natten_dit(
         lead_time_steps: the number of possible lead time steps, if 0 lead time embedding will be disabled
         **model_kwargs: any additional parameters to the model
     Returns:
-        EDMPrecond or StormCastUNet: a wrapped torch module net(x+n, sigma, condition, class_labels) -> x
+        EDMPreconditioner: a wrapped torch module net(x+n, sigma, condition) -> x
     """
 
     condition_dim = scalar_condition_channels + lead_time_steps
@@ -211,13 +211,15 @@ def build_network_condition_and_target(
         condition = [
             y for c in condition_list if (y := condition_tensors[c]) is not None
         ]
-        condition = torch.cat(condition, dim=1)
+        condition = torch.cat(condition, dim=1) if condition else None
 
     if scalar_conditions is not None:
         condition = TensorDict(
-            {"cond_concat": condition, "cond_vec": scalar_conditions},
-            device=condition.device,
-        ).to(dtype=condition.dtype)
+            {"cond_concat": condition, "cond_vec": scalar_conditions}
+            if condition is not None
+            else {"cond_vec": scalar_conditions},
+            device=state[1].device,
+        ).to(dtype=state[1].dtype)
 
     return (condition, target, condition_tensors["regression"])
 
@@ -230,8 +232,12 @@ def unpack_batch(
     """Unpack a data batch into background, state and lead time label with the correct
     device and data types.
     """
+    if isinstance(batch["state"], torch.Tensor):
+        # downscaling and unconditional models may return a single tensor as "state"
+        batch["state"] = [None, batch["state"]]
+
     (background, state, mask) = nested_to(
-        (batch["background"], batch["state"], batch.get("mask")),
+        (batch.get("background"), batch["state"], batch.get("mask")),
         device=device,
         dtype=torch.float32,
         non_blocking=True,
@@ -256,28 +262,102 @@ def diffusion_model_forward(
     model: Module,
     condition: torch.Tensor,
     shape: Iterable[int],
+    scheduler: NoiseScheduler,
+    dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
     lead_time_label: torch.Tensor | None = None,
     sampler_args: dict[str, Any] = {},
 ) -> torch.Tensor:
-    """Helper function to run diffusion model sampling"""
+    """Run diffusion model sampling using the ``physicsnemo.diffusion`` API.
 
-    # TODO: avoid creating full tensor here when sharding
-    latents = torch.randn(*shape, device=condition.device, dtype=condition.dtype)
+    Uses the provided noise scheduler for timestep generation and
+    :func:`~physicsnemo.diffusion.samplers.sample` for the reverse ODE
+    integration.
 
-    if not hasattr(model, "sigma_min"):
-        model.sigma_min = 0.0
-    if not hasattr(model, "sigma_max"):
-        model.sigma_max = np.inf
-    if not hasattr(model, "round_sigma"):
-        model.round_sigma = torch.as_tensor
+    For domain-parallel inference, pass a scheduler that has already been
+    wrapped with
+    :class:`~physicsnemo.diffusion.DomainParallelNoiseScheduler` (e.g.
+    via :meth:`~utils.parallel.ParallelHelper.make_domain_parallel_scheduler`).
 
-    return deterministic_sampler(
-        model,
-        latents=latents,
-        img_lr=condition,
-        lead_time_label=lead_time_label,
-        dtype=condition.dtype,
-        **sampler_args,
+    Parameters
+    ----------
+    model : Module
+        Preconditioned diffusion model (``EDMPreconditioner``).
+    condition : torch.Tensor
+        Conditioning tensor for the model.
+    shape : Iterable[int]
+        Shape of the output tensor, e.g. ``(B, C, H, W)``.
+    scheduler : NoiseScheduler
+        Noise scheduler (e.g.
+        :class:`~physicsnemo.diffusion.noise_schedulers.EDMNoiseScheduler`).
+    dtype : torch.dtype, optional
+        Precision for ODE integration. Defaults to the condition tensor's dtype.
+    device : torch.device, optional
+        Device for latent generation. Defaults to the condition tensor's device.
+    lead_time_label : torch.Tensor | None
+        Lead-time labels forwarded to the model.
+    sampler_args : dict
+        Sampler configuration. Supported keys: ``num_steps``,
+        ``solver`` (``"heun"`` or ``"euler"``),
+        ``S_churn``, ``S_min``, ``S_max``, ``S_noise``.
+    """
+    if isinstance(condition, TensorDict):
+        ref_tensor = condition.get("cond_concat", condition.get("cond_vec"))
+        if ref_tensor is None:
+            raise ValueError(
+                "condition TensorDict must contain 'cond_concat' or 'cond_vec'"
+                "if a TensorDict is passed as condition."
+            )
+    else:
+        ref_tensor = condition
+    if dtype is None:
+        dtype = ref_tensor.dtype
+    if device is None:
+        device = ref_tensor.device
+
+    sa = sampler_args
+    num_steps = sa.get("num_steps", 18)
+    solver_name = sa.get("solver", "heun")
+    S_churn = float(sa.get("S_churn", 0))
+    S_min = float(sa.get("S_min", 0))
+    S_max = float(sa.get("S_max", float("inf")))
+    S_noise = float(sa.get("S_noise", 1))
+
+    B = shape[0]
+    t_steps = scheduler.timesteps(num_steps, device=device, dtype=dtype)
+    tN = t_steps[0].expand(B)
+    xN = scheduler.init_latents(tuple(shape[1:]), tN, device=device, dtype=dtype)
+
+    extra_kwargs: dict[str, Any] = {}
+    if lead_time_label is not None:
+        extra_kwargs["lead_time_label"] = lead_time_label
+
+    def x0_predictor(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return model(x, t, condition=condition, **extra_kwargs)
+
+    denoiser = scheduler.get_denoiser(x0_predictor=x0_predictor)
+
+    solver_options: dict[str, Any] | None = None
+    if S_churn > 0:
+        solver_name = (
+            "edm_stochastic_heun" if solver_name == "heun" else "edm_stochastic_euler"
+        )
+        solver_options = {
+            "S_churn": S_churn,
+            "S_min": S_min,
+            "S_max": S_max,
+            "S_noise": S_noise,
+            "num_steps": num_steps,
+        }
+
+    return diffusion_sample(
+        denoiser,
+        xN,
+        scheduler,
+        num_steps,
+        solver=solver_name,
+        solver_options=solver_options,
+        time_steps=t_steps,
     )
 
 
@@ -301,44 +381,6 @@ def regression_model_forward(
 
     labels = {} if lead_time_label is None else {"lead_time_label": lead_time_label}
     return model(x, **labels)
-
-
-def regression_loss_fn(
-    net: Module,
-    images: torch.Tensor,
-    condition: torch.Tensor,
-    class_labels: None = None,
-    lead_time_label: torch.Tensor | None = None,
-    augment_pipe: Callable | None = None,
-    return_model_outputs: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Helper function for training the StormCast regression model, so that it has a similar call signature as
-    the EDMLoss and the same training loop can be used to train both regression and diffusion models
-
-    Args:
-        net: physicsnemo.models.diffusion.StormCastUNet
-        images: Target data, shape [batch_size, target_channels, w, h]
-        condition: input to the model, shape=[batch_size, condition_channel, w, h]
-        class_labels: unused (applied to match EDMLoss signature)
-        lead_time_label: lead time label or None if lead time embedding is not used
-        augment_pipe: optional data augmentation pipe
-        return_model_outputs: If True, will return the generated outputs
-    Returns:
-        out: loss function with shape [batch_size, target_channels, w, h]
-            This should be averaged to get the mean loss for gradient descent.
-    """
-
-    y, augment_labels = (
-        augment_pipe(images) if augment_pipe is not None else (images, None)
-    )
-
-    labels = {} if lead_time_label is None else {"lead_time_label": lead_time_label}
-    D_yn = net(x=condition, **labels)
-    loss = (D_yn - y) ** 2
-    if return_model_outputs:
-        return loss, D_yn
-    else:
-        return loss
 
 
 def nested_to(
