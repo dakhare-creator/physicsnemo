@@ -39,7 +39,7 @@ from test.common import (
     ["default_structured", "custom_irregular"],
     ids=["with_defaults_structured", "with_custom_irregular"],
 )
-def test_flare_transolver_constructor(config):
+def test_flare_constructor(config):
     """Test FLARE model constructor and attributes."""
     if config == "default_structured":
         model = FLARE(
@@ -77,15 +77,13 @@ def test_flare_transolver_constructor(config):
         assert model.embedding_dim == 3
         assert len(model.blocks) == 8
 
-    assert isinstance(model, Module), (
-        "FLARE should inherit from physicsnemo.Module"
-    )
+    assert isinstance(model, Module), "FLARE should inherit from physicsnemo.Module"
     assert hasattr(model, "preprocess"), "Model should have preprocess MLP"
     assert hasattr(model, "blocks"), "Model should have transformer blocks"
     assert hasattr(model, "meta"), "Model should have metadata"
 
 
-def test_flare_transolver2d_forward(device):
+def test_flare_2d_forward(device):
     """Test FLARE 2D forward pass"""
     torch.manual_seed(0)
     model = FLARE(
@@ -115,12 +113,12 @@ def test_flare_transolver2d_forward(device):
             fx,
             embedding,
         ),
-        file_name="experimental/models/flare/data/transolver2d_flare_output.pth",
+        file_name="experimental/models/flare/data/flare_2d_output.pth",
         atol=2e-3,
     )
 
 
-def test_flare_transolver_irregular_forward(device):
+def test_flare_irregular_forward(device):
     """Test FLARE irregular forward pass"""
     torch.manual_seed(0)
     model = FLARE(
@@ -151,12 +149,12 @@ def test_flare_transolver_irregular_forward(device):
             embedding,
             functional_input,
         ),
-        file_name="experimental/models/flare/data/transolver_irregular_flare_output.pth",
+        file_name="experimental/models/flare/data/flare_irregular_output.pth",
         atol=1e-3,
     )
 
 
-def test_flare_transolver_optims(device):
+def test_flare_optims(device):
     """Test FLARE optimizations"""
 
     def setup_model():
@@ -230,7 +228,7 @@ def test_flare_transolver_optims(device):
     )
 
 
-def test_flare_transolver_checkpoint(device):
+def test_flare_checkpoint(device):
     """Test FLARE checkpoint save/load"""
     model_1 = FLARE(
         structured_shape=None,
@@ -282,7 +280,7 @@ def test_flare_transolver_checkpoint(device):
 
 
 @check_ort_version()
-def test_flare_transolver_deploy(device):
+def test_flare_deploy(device):
     """Test FLARE deployment support"""
     model = FLARE(
         structured_shape=(85, 85),

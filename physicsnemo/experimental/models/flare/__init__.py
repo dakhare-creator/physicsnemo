@@ -20,6 +20,6 @@ This module provides FLARE, a Transolver variant that uses
 FLARE (Fast Low-rank Attention Routing Engine) attention.
 """
 
-from .transolver import FLARE
+from .flare import FLARE
 
 __all__ = ["FLARE"]
