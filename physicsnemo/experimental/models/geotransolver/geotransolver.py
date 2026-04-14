@@ -319,6 +319,7 @@ class GeoTransolver(Module):
         neighbors_in_radius: list[int] | None = None,
         n_hidden_local: int = 32,
         attention_type: str = "GALE",
+        concrete_dropout: bool = False,
     ) -> None:
         super().__init__(meta=GeoTransolverMetaData())
         self.__name__ = "GeoTransolver"
@@ -361,6 +362,7 @@ class GeoTransolver(Module):
             use_te=use_te,
             plus=plus,
             include_local_features=self.include_local_features,
+            concrete_dropout=concrete_dropout,
         )
         context_dim = self.context_builder.get_context_dim()
 
@@ -409,6 +411,7 @@ class GeoTransolver(Module):
                     plus=plus,
                     context_dim=context_dim,
                     attention_type=attention_type,
+                    concrete_dropout=concrete_dropout,
                 )
                 for layer_idx in range(n_layers)
             ]
