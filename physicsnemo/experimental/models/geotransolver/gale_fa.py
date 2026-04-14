@@ -29,6 +29,7 @@ from einops import rearrange
 from jaxtyping import Float
 
 from physicsnemo.core.version_check import check_version_spec, OptionalImport
+from physicsnemo.nn import ConcreteDropout
 
 # Check optional dependency availability
 TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False)
@@ -64,6 +65,9 @@ class GALE_FA(nn.Module):
         Whether to use Transformer Engine backend when available. Default is False.
     context_dim : int, optional
         Dimension of the context vector for cross-attention. Default is 0.
+    concrete_dropout : bool, optional
+        Whether to use learned concrete dropout instead of standard dropout.
+        Default is ``False``.
 
     Forward
     -------
@@ -114,6 +118,7 @@ class GALE_FA(nn.Module):
         n_global_queries: int = 64,
         use_te: bool = True,
         context_dim: int = 0,
+        concrete_dropout: bool = False,
     ):
         if use_te:
             raise ValueError(
@@ -160,7 +165,13 @@ class GALE_FA(nn.Module):
 
         # Linear projection for output
         self.out_linear = linear_layer(inner_dim, dim)
-        self.out_dropout = nn.Dropout(dropout)
+        if concrete_dropout:
+            self.out_dropout = ConcreteDropout(
+                in_features=dim,
+                init_p=max(dropout, 0.05),
+            )
+        else:
+            self.out_dropout = nn.Dropout(dropout)
 
 
     def forward(
